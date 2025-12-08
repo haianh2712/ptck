@@ -17,7 +17,7 @@ if 'data_raw' not in st.session_state:
 if 'has_run' not in st.session_state:
     st.session_state.has_run = False
 
-st.title("📊 DASHBOARD V64 (FIX NAME ERROR)")
+st.title("📊 DASHBOARD PHÂN TÍCH HIỆU QUẢ")
 st.markdown("---")
 
 # ==============================================================================
@@ -540,4 +540,5 @@ if st.session_state.has_run and st.session_state.data_raw:
         if not df_inv_show.empty: st.dataframe(df_inv_show, use_container_width=True)
         else: st.info("Không có hàng tồn kho cho các mã đã chọn.")
     with t3: st.dataframe(df_cycles_show, use_container_width=True)
+
     with t4: st.dataframe(df_warn_show, use_container_width=True)
