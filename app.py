@@ -10,29 +10,29 @@ import traceback
 # ==============================================================================
 # 1. CẤU HÌNH TRANG
 # ==============================================================================
-st.set_page_config(page_title="Investment V64 (Final Fix)", layout="wide")
+st.set_page_config(page_title="Investment V70 (Exact Fix)", layout="wide")
 
 if 'data_raw' not in st.session_state:
     st.session_state.data_raw = None
 if 'has_run' not in st.session_state:
     st.session_state.has_run = False
 
-st.title("📊 DASHBOARD PHÂN TÍCH HIỆU QUẢ")
+st.title("📊 DASHBOARD V70 (KHỚP DỮ LIỆU CHÍNH XÁC)")
 st.markdown("---")
 
 # ==============================================================================
-# 2. SIDEBAR
+# 2. SIDEBAR - BỘ ĐIỀU KHIỂN
 # ==============================================================================
 with st.sidebar:
     st.header("1. Dữ liệu")
     uploaded_file = st.file_uploader("Upload 'history3.xlsx':", type=['xlsx'])
     
+    # --- CHỌN CỘT LÃI LỖ ---
     user_pl_col = None
     if uploaded_file is not None:
         try:
             uploaded_file.seek(0)
             df_preview = pd.read_excel(uploaded_file, sheet_name='Lãi lỗ')
-            df_preview.columns = [str(c).strip() for c in df_preview.columns]
             all_cols = list(df_preview.columns)
             default_ix = 0
             for i, col in enumerate(all_cols):
@@ -58,7 +58,7 @@ with st.sidebar:
     LIMIT_CAP = st.number_input("Vốn > VNĐ", value=100000000)
 
 # ==============================================================================
-# 3. HÀM HỖ TRỢ (HELPER FUNCTIONS)
+# 3. HÀM HỖ TRỢ
 # ==============================================================================
 def safe_date(obj):
     if pd.isna(obj): return None
@@ -117,9 +117,7 @@ def fmt_vn(val, decimals=0):
         return s.replace(",", "X").replace(".", ",").replace("X", ".")
     except: return val
 
-# --- [FIXED] ĐÃ BỔ SUNG LẠI HÀM NÀY ---
 def format_date_vn(df, col_name):
-    """Hàm định dạng ngày tháng cho cột cụ thể"""
     if col_name in df.columns:
         df[col_name] = pd.to_datetime(df[col_name], errors='coerce')
         df[col_name] = df[col_name].dt.strftime('%d/%m/%Y').fillna('')
@@ -129,9 +127,11 @@ def apply_format_df(df):
     df_show = df.copy()
     for col in df_show.columns:
         c_lower = str(col).lower()
-        if any(x in c_lower for x in ['vốn', 'lãi', 'giá', 'tiền', 'amount', 'price', 'cost', 'sl', 'qty', 'kl']):
+        if any(x in c_lower for x in ['vốn', 'lãi', 'giá', 'tiền', 'amount', 'price', 'cost', 'tăng']):
             if 'ngày' not in c_lower:
                 df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 0))
+        elif any(x in c_lower for x in ['sl', 'qty', 'kl']):
+            df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 0))
         elif '%' in str(col) or 'roi' in c_lower or 'suất' in c_lower:
             df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 2) + '%' if isinstance(x, (int, float)) else x)
         elif pd.api.types.is_datetime64_any_dtype(df_show[col]):
@@ -141,66 +141,135 @@ def apply_format_df(df):
              df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 1) if isinstance(x, (int, float)) and x > 0 else ("-" if x==0 else x))
     return df_show
 
+# --- [NEW] HÀM TÍNH TỔNG NẠP (LOGIC MỚI) ---
+def auto_calculate_deposit(file_obj):
+    total = 0
+    debug_rows = []
+    msg = ""
+    
+    try:
+        file_obj.seek(0)
+        xls = pd.ExcelFile(file_obj)
+        
+        # 1. Tìm sheet Tiền
+        target_sheet = None
+        for s in xls.sheet_names:
+            if 'tiền' in s.lower() or 'cash' in s.lower():
+                target_sheet = s; break
+        
+        if target_sheet:
+            file_obj.seek(0)
+            df = pd.read_excel(file_obj, sheet_name=target_sheet)
+            
+            # 2. Tìm Cột Mô Tả và Cột Tăng
+            col_desc = None
+            col_amt = None # Cột tiền vào
+            
+            for c in df.columns:
+                c_str = str(c).lower().strip()
+                if 'mô tả' in c_str: col_desc = c
+                # Logic mới: Tìm cột "Tăng" (như trong file csv bạn gửi)
+                if c_str == 'tăng' or 'ps tăng' in c_str: col_amt = c
+            
+            if not col_amt: # Fallback tìm cột Amount nếu ko thấy Tăng
+                for c in df.columns:
+                    if 'số tiền' in str(c).lower() or 'amount' in str(c).lower(): col_amt = c; break
+
+            # 3. Lọc theo từ khóa cứng
+            # "CASHIN Chuyen tien vao tai khoan chung khoan 116C680939-callCreditMoney"
+            TARGET_KEYWORD = "cashin chuyen tien vao tai khoan chung khoan 116c680939-callcreditmoney"
+            
+            if col_desc and col_amt:
+                for _, row in df.iterrows():
+                    val = pd.to_numeric(row[col_amt], errors='coerce')
+                    desc = str(row[col_desc]).lower()
+                    
+                    # Logic chính xác:
+                    if val > 0 and TARGET_KEYWORD in desc:
+                        total += val
+                        debug_rows.append({
+                            'Ngày': row.get('Ngày', ''),
+                            'Mô tả': row[col_desc],
+                            'Số tiền': val
+                        })
+                msg = "OK"
+            else:
+                msg = f"Không tìm thấy cột 'Mô tả' hoặc cột 'Tăng' trong sheet {target_sheet}"
+        else:
+            msg = "Không tìm thấy sheet nào tên là 'Tiền'"
+            
+    except Exception as e:
+        msg = str(e)
+        
+    return total, debug_rows, msg
+
 # ==============================================================================
-# 4. LOGIC XỬ LÝ (CORE)
+# 4. LOGIC XỬ LÝ CHÍNH
 # ==============================================================================
-def run_logic_v64(f_in, pl_col):
-    # --- B1: MAP GIA ---
+def run_logic_v70(f_in, pl_col):
+    # --- B1: TÍNH TIỀN NẠP ---
+    total_deposit, deposit_debug, msg = auto_calculate_deposit(f_in)
+    
+    # --- B2: LOGIC CŨ (MAP GIÁ, CP, LÃI LỖ) ---
     price_map = {} 
     fee_map = {} 
     cap_map = defaultdict(float)
     
     df_money = None
-    cols_safe = [0, 1, 3]
+    # Định nghĩa index các cột quan trọng trong Sheet Tiền để map giá
+    # File của bạn: Ngày(0), Mô tả(1), Tăng(2), Giảm(3)
+    # Ta cần lấy: Ngày, Mô tả, Giảm (vì mua là bị trừ tiền - Giảm) hoặc Tăng (nếu là hoàn ứng/nạp)
+    # Tuy nhiên, để map giá vốn mua, ta cần tìm các dòng "Trả tiền mua..." -> Số tiền nằm ở cột "Giảm"
+    
+    # Tìm sheet tiền để map giá
     for s in ['SK Tiền', 'CK Tiền', 'Sheet1']:
         f_in.seek(0)
         tmp = read_ex(f_in, s)
         if tmp is not None:
-            if 'Ngày' not in tmp.columns:
-                f_in.seek(0)
-                tmp = pd.read_excel(f_in, sheet_name=s, header=None)
-                tmp = tmp.iloc[:, cols_safe]
-                tmp.columns = ['Ngay', 'MoTa', 'Tien']
-            else:
-                try:
-                    tmp = tmp.iloc[:, cols_safe]
-                    tmp.columns = ['Ngay', 'MoTa', 'Tien']
-                except: pass
-            df_money = tmp
-            break
+            # Check cột
+            if 'Ngày' in tmp.columns and 'Mô tả' in tmp.columns:
+                df_money = tmp
+                break
             
     if df_money is not None:
-        s_val = pd.to_numeric(df_money['Tien'], errors='coerce')
-        df_money['Tien'] = s_val.fillna(0)
-        df_money = df_money[df_money['Tien'] > 0]
+        # Cột chi tiền mua thường là cột 'Giảm' trong sổ cái tiền
+        col_out = None
+        for c in df_money.columns:
+            if 'giảm' in str(c).lower(): col_out = c; break
         
-        tmp_buy = defaultdict(lambda: {'q':0, 'c':0})
-        
-        for _, r in df_money.iterrows():
-            parsed = parse_desc(str(r['MoTa']))
-            if parsed:
-                typ, qty, tik, d_tx = parsed
-                if not d_tx: d_tx = safe_date(r['Ngay'])
-                
-                if typ in ['BUY_COST', 'BUY_FEE']:
-                    cap_map[tik] += r['Tien']
-                
-                if d_tx:
-                    k = (tik, d_tx)
-                    if typ == 'BUY_COST':
-                        tmp_buy[k]['q'] += qty
-                        tmp_buy[k]['c'] += r['Tien']
-                    elif typ == 'BUY_FEE':
-                        tmp_buy[k]['c'] += r['Tien']
-                    elif typ in ['SELL_FEE', 'SELL_TAX']:
-                        if k not in fee_map: fee_map[k] = {'f':0, 'q':0}
-                        fee_map[k]['f'] += r['Tien']
-                        fee_map[k]['q'] += qty
-        
-        for k, v in tmp_buy.items():
-            if v['q'] > 0: price_map[k] = v['c'] / v['q']
+        # Nếu ko thấy cột Giảm, thử dùng cột 'Số tiền' chung (nếu file cấu trúc khác)
+        if not col_out:
+             for c in df_money.columns:
+                if 'số tiền' in str(c).lower(): col_out = c; break
 
-    # --- B2: CP ---
+        if col_out:
+            s_val = pd.to_numeric(df_money[col_out], errors='coerce')
+            df_money['Money_Out'] = s_val.fillna(0)
+            
+            # Lọc các dòng chi tiền > 0
+            df_pos = df_money[df_money['Money_Out'] > 0]
+            
+            tmp_buy = defaultdict(lambda: {'q':0, 'c':0})
+            
+            for _, r in df_pos.iterrows():
+                parsed = parse_desc(str(r['Mô tả'])) # Giả định cột tên là Mô tả
+                if parsed:
+                    typ, qty, tik, d_tx = parsed
+                    if not d_tx: d_tx = safe_date(r['Ngày'])
+                    
+                    if typ in ['BUY_COST', 'BUY_FEE']: cap_map[tik] += r['Money_Out']
+                    if d_tx:
+                        k = (tik, d_tx)
+                        if typ == 'BUY_COST':
+                            tmp_buy[k]['q'] += qty; tmp_buy[k]['c'] += r['Money_Out']
+                        elif typ == 'BUY_FEE': tmp_buy[k]['c'] += r['Money_Out']
+                        elif typ in ['SELL_FEE', 'SELL_TAX']:
+                            if k not in fee_map: fee_map[k] = {'f':0, 'q':0}
+                            fee_map[k]['f'] += r['Money_Out']; fee_map[k]['q'] += qty
+            
+            for k, v in tmp_buy.items():
+                if v['q'] > 0: price_map[k] = v['c'] / v['q']
+
     events = []
     f_in.seek(0)
     df_cp = read_ex(f_in, 'CP')
@@ -209,7 +278,6 @@ def run_logic_v64(f_in, pl_col):
         df_cp = df_cp.rename(columns=ren)
         df_cp['Date'] = pd.to_datetime(df_cp['Date'], dayfirst=True, format='mixed', errors='coerce')
         df_cp.dropna(subset=['Date', 'Tik'], inplace=True)
-        
         df_cp['Out'] = pd.to_numeric(df_cp['Out'], errors='coerce').fillna(0)
         df_cp['In'] = pd.to_numeric(df_cp['In'], errors='coerce').fillna(0)
         
@@ -228,16 +296,13 @@ def run_logic_v64(f_in, pl_col):
                         for d in range(-5, 6):
                             chk = d_tx + datetime.timedelta(days=d)
                             if (tik, chk) in price_map: p = price_map[(tik, chk)]; break
-                evt = {'date': d_row, 'd_tx': d_tx, 'type': 'BUY', 'tik': tik, 'qty': r['In'], 'price': p}
-                events.append(evt)
+                events.append({'date': d_row, 'd_tx': d_tx, 'type': 'BUY', 'tik': tik, 'qty': r['In'], 'price': p})
             
             if r['Out'] > 0:
-                evt = {'date': d_row, 'd_tx': d_tx, 'type': 'SELL', 'tik': tik, 'qty': r['Out'], 'price': 0}
-                events.append(evt)
+                events.append({'date': d_row, 'd_tx': d_tx, 'type': 'SELL', 'tik': tik, 'qty': r['Out'], 'price': 0})
 
     events.sort(key=lambda x: x['date'])
 
-    # --- B3: LAI LO ---
     raw_sales = [] 
     mkt_map = {}
     f_in.seek(0)
@@ -251,8 +316,7 @@ def run_logic_v64(f_in, pl_col):
             qty = pd.to_numeric(r.iloc[2], errors='coerce') or 0
             
             pl = 0
-            if pl_col in r:
-                pl = pd.to_numeric(r[pl_col], errors='coerce') or 0
+            if pl_col and pl_col in r: pl = pd.to_numeric(r[pl_col], errors='coerce') or 0
             
             cost = 0; match_p = 0
             for c in df_ll.columns:
@@ -264,17 +328,12 @@ def run_logic_v64(f_in, pl_col):
             if cost == 0:
                 uc = 0
                 for c in df_ll.columns:
-                    if str(c).strip() == 'Giá vốn':
-                        uc = pd.to_numeric(r[c], errors='coerce') or 0
+                    if str(c).strip() == 'Giá vốn': uc = pd.to_numeric(r[c], errors='coerce') or 0
                 cost = uc * qty
                 
             if d_sell and match_p > 0: mkt_map[(tik, d_sell)] = match_p
-            
-            raw_sales.append({
-                'Mã CK': tik, 'Ngày Bán': d_sell, 'SL Bán': qty, 'Vốn Bán': cost, 'Lãi/Lỗ': pl
-            })
+            raw_sales.append({'Mã CK': tik, 'Ngày Bán': d_sell, 'SL Bán': qty, 'Vốn Bán': cost, 'Lãi/Lỗ': pl})
 
-    # --- B4: FIFO ---
     inv = {}; cycles_active = {}; cycles_closed = []
     today = datetime.date.today()
     days_sold_map = defaultdict(list) 
@@ -285,7 +344,6 @@ def run_logic_v64(f_in, pl_col):
         if e['type'] == 'BUY':
             if tik not in inv: inv[tik] = deque()
             inv[tik].append({'d': d, 'q': e['qty'], 'p': e['price']})
-            
             if tik not in cycles_active:
                 cycles_active[tik] = {'start': d, 'buy_q': 0, 'cur_q': 0, 'cost': 0, 'pl': 0}
             cycles_active[tik]['buy_q'] += e['qty']
@@ -300,7 +358,6 @@ def run_logic_v64(f_in, pl_col):
                     for i in range(-5, 6):
                         chk = d_tx + datetime.timedelta(days=i)
                         if (tik, chk) in mkt_map: gp = mkt_map[(tik, chk)]; break
-                
                 fee_val = 0
                 f_inf = fee_map.get((tik, d_tx))
                 if not f_inf:
@@ -333,24 +390,19 @@ def run_logic_v64(f_in, pl_col):
                     dur = (d - cyc['start']).days
                     roi = 0
                     if cyc['cost'] > 0: roi = (cyc['pl'] / cyc['cost']) * 100
-                    c_row = {'Mã CK': tik, 'Ngày Bắt Đầu': cyc['start'], 'Ngày Kết Thúc': d, 
+                    cycles_closed.append({'Mã CK': tik, 'Ngày Bắt Đầu': cyc['start'], 'Ngày Kết Thúc': d, 
                              'Tuổi Vòng Đời': max(1, dur), 'Tổng Vốn': cyc['cost'], 
-                             'Lãi/Lỗ': cyc['pl'], '% ROI': roi, 'Status': 'Đã tất toán'}
-                    cycles_closed.append(c_row)
+                             'Lãi/Lỗ': cyc['pl'], '% ROI': roi, 'Status': 'Đã tất toán'})
 
     for tik, dat in cycles_active.items():
         dur = (today - dat['start']).days
-        c_row = {'Mã CK': tik, 'Ngày Bắt Đầu': dat['start'], 'Ngày Kết Thúc': None, 
-                 'Tuổi Vòng Đời': dur, 'Tổng Vốn': dat['cost'], 'Lãi/Lỗ': dat['pl'], 
-                 'Status': 'Đang nắm giữ'}
-        cycles_closed.append(c_row)
+        cycles_closed.append({'Mã CK': tik, 'Ngày Bắt Đầu': dat['start'], 'Ngày Kết Thúc': None, 
+                 'Tuổi Vòng Đời': dur, 'Tổng Vốn': dat['cost'], 'Lãi/Lỗ': dat['pl'], 'Status': 'Đang nắm giữ'})
 
     return {
-        'raw_sales': raw_sales,
-        'cycles': cycles_closed,
-        'inventory': inv,
-        'capital_map': cap_map,
-        'days_sold_map': days_sold_map
+        'raw_sales': raw_sales, 'cycles': cycles_closed, 'inventory': inv,
+        'capital_map': cap_map, 'days_sold_map': days_sold_map,
+        'total_deposit': total_deposit, 'deposit_debug': deposit_debug, 'msg': msg
     }
 
 # ==============================================================================
@@ -365,9 +417,9 @@ if btn_run:
     elif user_pl_col is None:
         st.error("⚠️ Vui lòng chọn cột Lãi/Lỗ")
     else:
-        with st.spinner("Đang tính toán (V64)..."):
+        with st.spinner("Đang tính toán (V70)..."):
             try:
-                raw_data = run_logic_v64(uploaded_file, user_pl_col)
+                raw_data = run_logic_v70(uploaded_file, user_pl_col)
                 st.session_state.data_raw = raw_data
                 st.session_state.has_run = True
             except Exception as e:
@@ -379,7 +431,17 @@ if st.session_state.has_run and st.session_state.data_raw:
     raw = st.session_state.data_raw
     st.success("✅ Đã xử lý xong!")
     
-    # 1. TOTAL CAPITAL
+    # ---------------------------------------------
+    # 1. HIỂN THỊ THÔNG TIN NẠP TIỀN (QUAN TRỌNG)
+    # ---------------------------------------------
+    total_dep_val = raw['total_deposit']
+    if total_dep_val == 0:
+        st.warning("⚠️ Không tìm thấy tiền nạp! Hãy kiểm tra lại.")
+        if raw['msg'] != "OK": st.error(raw['msg'])
+    else:
+        with st.expander(f"🔍 Chi tiết {len(raw['deposit_debug'])} lần nạp tiền (Tổng: {fmt_vn(total_dep_val)} VNĐ)"):
+            st.dataframe(pd.DataFrame(raw['deposit_debug']))
+
     all_tk_global = set(list(raw['capital_map'].keys()) + list(raw['inventory'].keys()))
     GLOBAL_TOTAL_HOLD_VAL = 0
     hold_map_global = {}
@@ -392,7 +454,7 @@ if st.session_state.has_run and st.session_state.data_raw:
         hold_map_global[tik] = val_h
         GLOBAL_TOTAL_HOLD_VAL += val_h
 
-    # 2. FILTER
+    # FILTER
     with st.sidebar:
         st.write("---")
         st.header("4. Lọc Mã Cổ Phiếu")
@@ -426,7 +488,6 @@ if st.session_state.has_run and st.session_state.data_raw:
             inv_rows.append({'Mã CK': t, 'Ngày Mua': b['d'], 'SL Tồn': b['q'], 'Giá Vốn': b['p']})
     df_inv = pd.DataFrame(inv_rows)
 
-    # 3. AGGREGATE
     agg_sales = {}
     if not df_sales.empty:
         agg_sales = df_sales.groupby('Mã CK').agg({'SL Bán':'sum','Vốn Bán':'sum','Lãi/Lỗ':'sum'}).to_dict('index')
@@ -444,7 +505,6 @@ if st.session_state.has_run and st.session_state.data_raw:
         
         avg_d_hold = d_sum/q_hold if q_hold > 0 else 0
         val_hold = hold_map_global.get(tik, 0)
-        
         s_inf = agg_sales.get(tik, {'SL Bán':0, 'Vốn Bán':0, 'Lãi/Lỗ':0})
         
         sold_list = raw['days_sold_map'].get(tik, [])
@@ -459,19 +519,12 @@ if st.session_state.has_run and st.session_state.data_raw:
                 q_sold_s += q
         
         avg_d_sold = 0
-        if q_sold_s > 0:
-            avg_d_sold = d_sold_s / q_sold_s
-        
+        if q_sold_s > 0: avg_d_sold = d_sold_s / q_sold_s
         pct_eff = (s_inf['Lãi/Lỗ']/s_inf['Vốn Bán']*100) if s_inf['Vốn Bán'] > 0 else 0
         
         final_rows.append({
-            'Mã CK': tik, 
-            'Lãi/Lỗ (Trong Kỳ)': s_inf['Lãi/Lỗ'], 
-            '% Hiệu Suất (Trong Kỳ)': pct_eff,
-            'SL Đang Giữ': q_hold, 
-            'Vốn Đang Giữ': val_hold, 
-            'Tuổi Kho TB': avg_d_hold, 
-            'Ngày Giữ TB (Bán)': avg_d_sold
+            'Mã CK': tik, 'Lãi/Lỗ (Trong Kỳ)': s_inf['Lãi/Lỗ'], '% Hiệu Suất (Trong Kỳ)': pct_eff,
+            'SL Đang Giữ': q_hold, 'Vốn Đang Giữ': val_hold, 'Tuổi Kho TB': avg_d_hold, 'Ngày Giữ TB (Bán)': avg_d_sold
         })
         
         w = []
@@ -486,14 +539,12 @@ if st.session_state.has_run and st.session_state.data_raw:
     if not df_final.empty: df_final = df_final.sort_values('Vốn Đang Giữ', ascending=False)
     df_warn = pd.DataFrame(warn_rows)
 
-    # --- FORMAT DATE ---
     if not df_cycles.empty:
         df_cycles = format_date_vn(df_cycles, 'Ngày Bắt Đầu')
         df_cycles = format_date_vn(df_cycles, 'Ngày Kết Thúc')
     if not df_inv.empty:
         df_inv = format_date_vn(df_inv, 'Ngày Mua')
 
-    # --- EXPORT ---
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine='xlsxwriter') as wr:
         df_final.to_excel(wr, sheet_name='HIỆU SUẤT', index=False)
@@ -501,15 +552,15 @@ if st.session_state.has_run and st.session_state.data_raw:
         if not df_cycles.empty: df_cycles.to_excel(wr, sheet_name='LỊCH SỬ', index=False)
         if not df_warn.empty: df_warn.to_excel(wr, sheet_name='CẢNH BÁO', index=False)
     
-    st.download_button("📥 Tải Excel (DD/MM/YYYY)", bio.getvalue(), "Bao_cao_V64.xlsx")
+    st.download_button("📥 Tải Excel (DD/MM/YYYY)", bio.getvalue(), "Bao_cao_V70.xlsx")
     
-    # --- DISPLAY ---
-    m1, m2 = st.columns(2)
+    m1, m2, m3 = st.columns(3)
     t_pl = df_final['Lãi/Lỗ (Trong Kỳ)'].sum()
     current_show_val = df_final['Vốn Đang Giữ'].sum()
     
-    m1.metric(f"Lãi/Lỗ ({start_date.strftime('%d/%m')} - {end_date.strftime('%d/%m')})", fmt_vn(t_pl) + " VNĐ", delta_color="normal" if t_pl>=0 else "inverse")
-    m2.metric(f"Vốn Đang Giữ (Hiển thị / Tổng)", f"{fmt_vn(current_show_val)} / {fmt_vn(GLOBAL_TOTAL_HOLD_VAL)} VNĐ")
+    m1.metric("💰 TỔNG TIỀN ĐÃ NẠP", fmt_vn(total_dep_val) + " VNĐ")
+    m2.metric(f"Lãi/Lỗ ({start_date.strftime('%d/%m')} - {end_date.strftime('%d/%m')})", fmt_vn(t_pl) + " VNĐ", delta_color="normal" if t_pl>=0 else "inverse")
+    m3.metric(f"Vốn Đang Giữ (Hiển thị / Tổng)", f"{fmt_vn(current_show_val)} / {fmt_vn(GLOBAL_TOTAL_HOLD_VAL)} VNĐ")
     
     st.markdown("---")
     c_chart1, c_chart2 = st.columns(2)
@@ -528,7 +579,6 @@ if st.session_state.has_run and st.session_state.data_raw:
     
     st.markdown("---")
     
-    # APPLY FORMAT VN FOR DISPLAY
     df_final_show = apply_format_df(df_final)
     df_inv_show = apply_format_df(df_inv)
     df_cycles_show = apply_format_df(df_cycles)
@@ -540,5 +590,4 @@ if st.session_state.has_run and st.session_state.data_raw:
         if not df_inv_show.empty: st.dataframe(df_inv_show, use_container_width=True)
         else: st.info("Không có hàng tồn kho cho các mã đã chọn.")
     with t3: st.dataframe(df_cycles_show, use_container_width=True)
-
     with t4: st.dataframe(df_warn_show, use_container_width=True)
