@@ -5,3 +5,6 @@ openpyxl
 xlsxwriter
 plotly
 matplotlib
+vnstock==0.2.9.2.3
+ipython
+requests
