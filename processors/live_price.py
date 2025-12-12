@@ -1,64 +1,73 @@
 # File: processors/live_price.py
+import yfinance as yf
 import pandas as pd
-try:
-    from vnstock import price_board
-except ImportError:
-    price_board = None
+import streamlit as st
 
 def get_current_price_dict(ticker_list):
     """
-    Lấy giá thị trường. Phiên bản "Hard-binding" cột Mã CP và Giá.
+    Lấy giá thị trường từ Yahoo Finance (Thông qua thư viện yfinance).
+    Nguồn này KHÔNG CHẶN IP Cloud, hoạt động ổn định trên Streamlit Cloud.
     """
     if not ticker_list:
         return {}
     
-    # 1. Làm sạch danh sách đầu vào
-    clean_tickers = list(set([str(t).strip().upper() for t in ticker_list if t]))
+    # 1. Chuẩn hóa mã (Yahoo yêu cầu đuôi .VN cho cổ phiếu Việt Nam)
+    # Lưu ý: Sàn UPCOM đôi khi không có trên Yahoo hoặc mã khác, nhưng HOSE/HNX thì ổn.
+    clean_tickers = [str(t).strip().upper() for t in ticker_list if t]
+    clean_tickers = list(set(clean_tickers))
     
-    if not clean_tickers or price_board is None:
+    if not clean_tickers:
         return {}
 
+    # Map: 'HPG' -> 'HPG.VN' để gọi API, sau đó map ngược lại để trả kết quả
+    yahoo_map = {t: f"{t}.VN" for t in clean_tickers}
+    yahoo_symbols = list(yahoo_map.values())
+    
+    price_dict = {}
+    
     try:
-        # 2. Gọi API
-        symbols_str = ",".join(clean_tickers)
-        df = price_board(symbols_str)
+        # 2. Gọi API Yahoo (Tải hàng loạt để nhanh hơn)
+        # period='1d' để lấy dữ liệu phiên mới nhất
+        data = yf.download(yahoo_symbols, period="1d", progress=False)
         
-        if df.empty:
-            print("⚠️ API trả về bảng rỗng.")
+        if data.empty:
+            print("⚠️ Yahoo Finance không trả về dữ liệu.")
             return {}
+
+        # 3. Trích xuất giá mới nhất
+        # yfinance trả về DataFrame MultiIndex nếu nhiều mã
+        # Chúng ta lấy cột 'Close' (Giá đóng cửa/giá hiện tại)
+        
+        # Lấy dòng cuối cùng (giá mới nhất)
+        if 'Close' in data:
+            last_rows = data['Close'].iloc[-1]
             
-        # 3. Tự động tìm tên cột (Tránh lỗi do đổi tên)
-        # Tìm cột chứa chữ "Mã" hoặc "Symbol"
-        col_sym = next((c for c in df.columns if "Mã" in c or "Symbol" in c), None)
-        # Tìm cột chứa chữ "Giá" hoặc "Price" (Ưu tiên 'Giá', bỏ qua 'Giá trần/sàn' nếu có)
-        col_price = next((c for c in df.columns if c in ['Giá', 'Price', 'Khớp lệnh', 'Last']), None)
-
-        if not col_sym or not col_price:
-            print(f"❌ Không tìm thấy cột Mã/Giá. Các cột hiện có: {df.columns.tolist()}")
-            return {}
-
-        # 4. Tạo Dictionary
-        price_dict = {}
-        for _, row in df.iterrows():
-            try:
-                sym = str(row[col_sym]).strip().upper()
-                price = row[col_price]
-                
-                # Chuyển đổi sang float an toàn
-                price = float(price)
-                
-                # Logic sửa lỗi đơn vị (Nếu giá < 500 đồng -> nhân 1000)
-                # Ví dụ: HPG = 26.55 -> 26550
-                if price < 500 and price > 0:
-                    price = price * 1000
+            # Duyệt qua từng mã gốc để lấy giá
+            for sym_raw, sym_vn in yahoo_map.items():
+                try:
+                    # Trường hợp 1: Tải nhiều mã, last_rows là Series có index là mã .VN
+                    if isinstance(last_rows, pd.Series):
+                        if sym_vn in last_rows:
+                            price = last_rows[sym_vn]
+                            if pd.notna(price):
+                                price_dict[sym_raw] = float(price)
                     
-                price_dict[sym] = price
-            except Exception as ex:
-                continue # Bỏ qua dòng lỗi
-                
-        print(f"✅ Đã khớp giá cho {len(price_dict)}/{len(clean_tickers)} mã.")
-        return price_dict
+                    # Trường hợp 2: Tải 1 mã, last_rows có thể là số float
+                    elif len(yahoo_symbols) == 1:
+                        # Khi tải 1 mã, structure có thể khác, ta check trực tiếp
+                        val = data['Close'].iloc[-1]
+                        # Nếu nó là Series (thường gặp ở bản mới), lấy .item()
+                        if isinstance(val, pd.Series):
+                            val = val.item()
+                        price_dict[sym_raw] = float(val)
 
+                except Exception as ex:
+                    print(f"Lỗi parse mã {sym_raw}: {ex}")
+                    continue
+
+        print(f"✅ [Yahoo] Đã lấy giá cho {len(price_dict)} mã.")
+        
     except Exception as e:
-        print(f"❌ Lỗi Fatal Live Price: {e}")
-        return {}
+        print(f"❌ Lỗi yfinance: {e}")
+    
+    return price_dict
