@@ -1,593 +1,435 @@
+# File: app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-from collections import deque, defaultdict
-import datetime
-import re
-import io
-import traceback
+import plotly.express as px
+
+# --- IMPORT MODULES ---
+try:
+    from processors.adapter_vck import VCKAdapter
+    from processors.adapter_vps import VPSAdapter
+    from processors.engine import PortfolioEngine
+    from processors.live_price import get_current_price_dict
+    from utils.formatters import fmt_vnd, fmt_num, fmt_pct, fmt_float
+    from analytics.performance import calculate_kpi
+    from analytics.time_machine import TimeMachine
+    from components.charts import (
+        draw_win_rate_pie, draw_pnl_distribution, 
+        draw_efficiency_scatter, draw_nav_growth_chart, draw_risk_reward_bar
+    )
+    from components.psychology_charts import (
+        draw_trading_timeline, 
+        draw_discipline_matrix,
+        draw_efficiency_vs_intensity,
+        draw_streak_analysis
+    )
+    from components.advanced_charts import (
+        draw_realized_drawdown,
+        draw_pnl_heatmap
+    )
+except ImportError as e:
+    st.error(f"⚠️ Lỗi cấu trúc: {e}")
+    st.stop()
 
 # ==============================================================================
-# 1. CẤU HÌNH TRANG
+# 1. CẤU HÌNH TỪ ĐIỂN TRI THỨC (KNOWLEDGE BASE)
 # ==============================================================================
-st.set_page_config(page_title="Investment V70 (Exact Fix)", layout="wide")
-
-if 'data_raw' not in st.session_state:
-    st.session_state.data_raw = None
-if 'has_run' not in st.session_state:
-    st.session_state.has_run = False
-
-st.title("📊 DASHBOARD V70 (KHỚP DỮ LIỆU CHÍNH XÁC)")
-st.markdown("---")
-
-# ==============================================================================
-# 2. SIDEBAR - BỘ ĐIỀU KHIỂN
-# ==============================================================================
-with st.sidebar:
-    st.header("1. Dữ liệu")
-    uploaded_file = st.file_uploader("Upload 'history3.xlsx':", type=['xlsx'])
-    
-    # --- CHỌN CỘT LÃI LỖ ---
-    user_pl_col = None
-    if uploaded_file is not None:
-        try:
-            uploaded_file.seek(0)
-            df_preview = pd.read_excel(uploaded_file, sheet_name='Lãi lỗ')
-            all_cols = list(df_preview.columns)
-            default_ix = 0
-            for i, col in enumerate(all_cols):
-                if 'lãi' in str(col).lower() and '%' not in str(col):
-                    default_ix = i; break
-            st.caption("Cột tiền Lãi/Lỗ:")
-            user_pl_col = st.selectbox("", all_cols, index=default_ix)
-        except: pass
-
-    st.markdown("---")
-    st.header("2. Bộ Lọc")
-    filter_type = st.radio("Thời gian:", ["Toàn thời gian", "Tùy chỉnh ngày"])
-    start_date = datetime.date(2020, 1, 1)
-    end_date = datetime.date.today()
-    if filter_type == "Tùy chỉnh ngày":
-        c1, c2 = st.columns(2)
-        with c1: start_date = st.date_input("Từ:", datetime.date.today().replace(day=1))
-        with c2: end_date = st.date_input("Đến:", datetime.date.today())
-
-    st.header("3. Rủi ro")
-    LIMIT_DAYS = st.number_input("Ngày giữ >", value=90)
-    LIMIT_ALLOC = st.slider("Tỷ trọng > %", 0.0, 1.0, 0.20)
-    LIMIT_CAP = st.number_input("Vốn > VNĐ", value=100000000)
-
-# ==============================================================================
-# 3. HÀM HỖ TRỢ
-# ==============================================================================
-def safe_date(obj):
-    if pd.isna(obj): return None
-    if isinstance(obj, str):
-        try: return pd.to_datetime(obj, dayfirst=True).date()
-        except: pass
-    if isinstance(obj, pd.Timestamp): return obj.date()
-    if isinstance(obj, datetime.datetime): return obj.date()
-    return obj
-
-def extract_date(text):
-    if not isinstance(text, str): return None
-    match = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", text)
-    if match:
-        d, m, y = match.groups()
-        if len(y) == 2: y = "20" + y
-        try: return datetime.date(int(y), int(m), int(d))
-        except: return None
-    return None
-
-def parse_desc(mo_ta):
-    if not isinstance(mo_ta, str): return None
-    p = r"(Trả tiền mua|Trả phí mua|Trả phí lệnh bán|Thuế TNCN bán|Thuế bán)\s*.*?(\d+)\s*([A-Za-z0-9_]+)"
-    match = re.search(p, mo_ta, re.IGNORECASE)
-    if match:
-        act = match.group(1).lower()
-        sl = int(match.group(2))
-        mack = match.group(3).upper()
-        d_tx = extract_date(mo_ta)
-        type_tx = None
-        if "trả tiền mua" in act: type_tx = 'BUY_COST'
-        elif "trả phí mua" in act: type_tx = 'BUY_FEE'
-        elif "trả phí lệnh bán" in act: type_tx = 'SELL_FEE'
-        elif "thuế" in act: type_tx = 'SELL_TAX'
-        return type_tx, sl, mack, d_tx
-    return None
-
-def check_0_dong(desc, ticker):
-    desc = str(desc).lower()
-    ticker = str(ticker).upper()
-    if ticker.endswith('_WFT'): return True
-    keys = ['thưởng', 'cổ tức', 'chuyển đổi', 'nhận', 'phát hành thêm', 'quyền mua']
-    for k in keys:
-        if k in desc and not desc.strip().startswith('mua '): return True
-    return False
-
-def read_ex(file, sheet):
-    try: return pd.read_excel(file, sheet_name=sheet)
-    except: return None
-
-def fmt_vn(val, decimals=0):
-    if pd.isna(val) or val == "": return "-"
-    try:
-        if decimals == 0: s = "{:,.0f}".format(val)
-        else: s = "{:,.2f}".format(val)
-        return s.replace(",", "X").replace(".", ",").replace("X", ".")
-    except: return val
-
-def format_date_vn(df, col_name):
-    if col_name in df.columns:
-        df[col_name] = pd.to_datetime(df[col_name], errors='coerce')
-        df[col_name] = df[col_name].dt.strftime('%d/%m/%Y').fillna('')
-    return df
-
-def apply_format_df(df):
-    df_show = df.copy()
-    for col in df_show.columns:
-        c_lower = str(col).lower()
-        if any(x in c_lower for x in ['vốn', 'lãi', 'giá', 'tiền', 'amount', 'price', 'cost', 'tăng']):
-            if 'ngày' not in c_lower:
-                df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 0))
-        elif any(x in c_lower for x in ['sl', 'qty', 'kl']):
-            df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 0))
-        elif '%' in str(col) or 'roi' in c_lower or 'suất' in c_lower:
-            df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 2) + '%' if isinstance(x, (int, float)) else x)
-        elif pd.api.types.is_datetime64_any_dtype(df_show[col]):
-            df_show[col] = df_show[col].dt.strftime('%d/%m/%Y').fillna('')
-        
-        if 'tuổi' in c_lower or 'giữ tb' in c_lower:
-             df_show[col] = df_show[col].apply(lambda x: fmt_vn(x, 1) if isinstance(x, (int, float)) and x > 0 else ("-" if x==0 else x))
-    return df_show
-
-# --- [NEW] HÀM TÍNH TỔNG NẠP (LOGIC MỚI) ---
-def auto_calculate_deposit(file_obj):
-    total = 0
-    debug_rows = []
-    msg = ""
-    
-    try:
-        file_obj.seek(0)
-        xls = pd.ExcelFile(file_obj)
-        
-        # 1. Tìm sheet Tiền
-        target_sheet = None
-        for s in xls.sheet_names:
-            if 'tiền' in s.lower() or 'cash' in s.lower():
-                target_sheet = s; break
-        
-        if target_sheet:
-            file_obj.seek(0)
-            df = pd.read_excel(file_obj, sheet_name=target_sheet)
-            
-            # 2. Tìm Cột Mô Tả và Cột Tăng
-            col_desc = None
-            col_amt = None # Cột tiền vào
-            
-            for c in df.columns:
-                c_str = str(c).lower().strip()
-                if 'mô tả' in c_str: col_desc = c
-                # Logic mới: Tìm cột "Tăng" (như trong file csv bạn gửi)
-                if c_str == 'tăng' or 'ps tăng' in c_str: col_amt = c
-            
-            if not col_amt: # Fallback tìm cột Amount nếu ko thấy Tăng
-                for c in df.columns:
-                    if 'số tiền' in str(c).lower() or 'amount' in str(c).lower(): col_amt = c; break
-
-            # 3. Lọc theo từ khóa cứng
-            # "CASHIN Chuyen tien vao tai khoan chung khoan 116C680939-callCreditMoney"
-            TARGET_KEYWORD = "cashin chuyen tien vao tai khoan chung khoan 116c680939-callcreditmoney"
-            
-            if col_desc and col_amt:
-                for _, row in df.iterrows():
-                    val = pd.to_numeric(row[col_amt], errors='coerce')
-                    desc = str(row[col_desc]).lower()
-                    
-                    # Logic chính xác:
-                    if val > 0 and TARGET_KEYWORD in desc:
-                        total += val
-                        debug_rows.append({
-                            'Ngày': row.get('Ngày', ''),
-                            'Mô tả': row[col_desc],
-                            'Số tiền': val
-                        })
-                msg = "OK"
-            else:
-                msg = f"Không tìm thấy cột 'Mô tả' hoặc cột 'Tăng' trong sheet {target_sheet}"
-        else:
-            msg = "Không tìm thấy sheet nào tên là 'Tiền'"
-            
-    except Exception as e:
-        msg = str(e)
-        
-    return total, debug_rows, msg
-
-# ==============================================================================
-# 4. LOGIC XỬ LÝ CHÍNH
-# ==============================================================================
-def run_logic_v70(f_in, pl_col):
-    # --- B1: TÍNH TIỀN NẠP ---
-    total_deposit, deposit_debug, msg = auto_calculate_deposit(f_in)
-    
-    # --- B2: LOGIC CŨ (MAP GIÁ, CP, LÃI LỖ) ---
-    price_map = {} 
-    fee_map = {} 
-    cap_map = defaultdict(float)
-    
-    df_money = None
-    # Định nghĩa index các cột quan trọng trong Sheet Tiền để map giá
-    # File của bạn: Ngày(0), Mô tả(1), Tăng(2), Giảm(3)
-    # Ta cần lấy: Ngày, Mô tả, Giảm (vì mua là bị trừ tiền - Giảm) hoặc Tăng (nếu là hoàn ứng/nạp)
-    # Tuy nhiên, để map giá vốn mua, ta cần tìm các dòng "Trả tiền mua..." -> Số tiền nằm ở cột "Giảm"
-    
-    # Tìm sheet tiền để map giá
-    for s in ['SK Tiền', 'CK Tiền', 'Sheet1']:
-        f_in.seek(0)
-        tmp = read_ex(f_in, s)
-        if tmp is not None:
-            # Check cột
-            if 'Ngày' in tmp.columns and 'Mô tả' in tmp.columns:
-                df_money = tmp
-                break
-            
-    if df_money is not None:
-        # Cột chi tiền mua thường là cột 'Giảm' trong sổ cái tiền
-        col_out = None
-        for c in df_money.columns:
-            if 'giảm' in str(c).lower(): col_out = c; break
-        
-        # Nếu ko thấy cột Giảm, thử dùng cột 'Số tiền' chung (nếu file cấu trúc khác)
-        if not col_out:
-             for c in df_money.columns:
-                if 'số tiền' in str(c).lower(): col_out = c; break
-
-        if col_out:
-            s_val = pd.to_numeric(df_money[col_out], errors='coerce')
-            df_money['Money_Out'] = s_val.fillna(0)
-            
-            # Lọc các dòng chi tiền > 0
-            df_pos = df_money[df_money['Money_Out'] > 0]
-            
-            tmp_buy = defaultdict(lambda: {'q':0, 'c':0})
-            
-            for _, r in df_pos.iterrows():
-                parsed = parse_desc(str(r['Mô tả'])) # Giả định cột tên là Mô tả
-                if parsed:
-                    typ, qty, tik, d_tx = parsed
-                    if not d_tx: d_tx = safe_date(r['Ngày'])
-                    
-                    if typ in ['BUY_COST', 'BUY_FEE']: cap_map[tik] += r['Money_Out']
-                    if d_tx:
-                        k = (tik, d_tx)
-                        if typ == 'BUY_COST':
-                            tmp_buy[k]['q'] += qty; tmp_buy[k]['c'] += r['Money_Out']
-                        elif typ == 'BUY_FEE': tmp_buy[k]['c'] += r['Money_Out']
-                        elif typ in ['SELL_FEE', 'SELL_TAX']:
-                            if k not in fee_map: fee_map[k] = {'f':0, 'q':0}
-                            fee_map[k]['f'] += r['Money_Out']; fee_map[k]['q'] += qty
-            
-            for k, v in tmp_buy.items():
-                if v['q'] > 0: price_map[k] = v['c'] / v['q']
-
-    events = []
-    f_in.seek(0)
-    df_cp = read_ex(f_in, 'CP')
-    if df_cp is not None:
-        ren = {'Ngày': 'Date', 'Mã CK': 'Tik', 'Giảm': 'Out', 'Tăng': 'In', 'Mô tả': 'Desc'}
-        df_cp = df_cp.rename(columns=ren)
-        df_cp['Date'] = pd.to_datetime(df_cp['Date'], dayfirst=True, format='mixed', errors='coerce')
-        df_cp.dropna(subset=['Date', 'Tik'], inplace=True)
-        df_cp['Out'] = pd.to_numeric(df_cp['Out'], errors='coerce').fillna(0)
-        df_cp['In'] = pd.to_numeric(df_cp['In'], errors='coerce').fillna(0)
-        
-        for _, r in df_cp.iterrows():
-            tik = str(r['Tik']).strip().upper()
-            desc = str(r['Desc'])
-            d_row = safe_date(r['Date'])
-            d_tx = extract_date(desc)
-            if not d_tx: d_tx = d_row
-            
-            if r['In'] > 0:
-                p = 0
-                if not check_0_dong(desc, tik):
-                    p = price_map.get((tik, d_tx), 0)
-                    if p == 0:
-                        for d in range(-5, 6):
-                            chk = d_tx + datetime.timedelta(days=d)
-                            if (tik, chk) in price_map: p = price_map[(tik, chk)]; break
-                events.append({'date': d_row, 'd_tx': d_tx, 'type': 'BUY', 'tik': tik, 'qty': r['In'], 'price': p})
-            
-            if r['Out'] > 0:
-                events.append({'date': d_row, 'd_tx': d_tx, 'type': 'SELL', 'tik': tik, 'qty': r['Out'], 'price': 0})
-
-    events.sort(key=lambda x: x['date'])
-
-    raw_sales = [] 
-    mkt_map = {}
-    f_in.seek(0)
-    df_ll = read_ex(f_in, 'Lãi lỗ')
-    
-    if df_ll is not None:
-        df_ll.columns = [str(c).strip() for c in df_ll.columns]
-        for _, r in df_ll.iterrows():
-            tik = str(r.iloc[1]).strip().upper()
-            d_sell = safe_date(r.iloc[0]) 
-            qty = pd.to_numeric(r.iloc[2], errors='coerce') or 0
-            
-            pl = 0
-            if pl_col and pl_col in r: pl = pd.to_numeric(r[pl_col], errors='coerce') or 0
-            
-            cost = 0; match_p = 0
-            for c in df_ll.columns:
-                cs = str(c).lower()
-                val = pd.to_numeric(r[c], errors='coerce') or 0
-                if 'giá trị vốn' in cs: cost = val
-                if 'khớp' in cs and 'giá' in cs: match_p = val
-            
-            if cost == 0:
-                uc = 0
-                for c in df_ll.columns:
-                    if str(c).strip() == 'Giá vốn': uc = pd.to_numeric(r[c], errors='coerce') or 0
-                cost = uc * qty
-                
-            if d_sell and match_p > 0: mkt_map[(tik, d_sell)] = match_p
-            raw_sales.append({'Mã CK': tik, 'Ngày Bán': d_sell, 'SL Bán': qty, 'Vốn Bán': cost, 'Lãi/Lỗ': pl})
-
-    inv = {}; cycles_active = {}; cycles_closed = []
-    today = datetime.date.today()
-    days_sold_map = defaultdict(list) 
-    
-    for e in events:
-        tik = e['tik']; d = e['date']; d_tx = e['d_tx']
-        
-        if e['type'] == 'BUY':
-            if tik not in inv: inv[tik] = deque()
-            inv[tik].append({'d': d, 'q': e['qty'], 'p': e['price']})
-            if tik not in cycles_active:
-                cycles_active[tik] = {'start': d, 'buy_q': 0, 'cur_q': 0, 'cost': 0, 'pl': 0}
-            cycles_active[tik]['buy_q'] += e['qty']
-            cycles_active[tik]['cur_q'] += e['qty']
-            cycles_active[tik]['cost'] += (e['qty'] * e['price'])
-            
-        elif e['type'] == 'SELL':
-            rem = e['qty']; sell_p = 0
-            if "_WFT" not in tik:
-                gp = mkt_map.get((tik, d_tx), 0)
-                if gp == 0:
-                    for i in range(-5, 6):
-                        chk = d_tx + datetime.timedelta(days=i)
-                        if (tik, chk) in mkt_map: gp = mkt_map[(tik, chk)]; break
-                fee_val = 0
-                f_inf = fee_map.get((tik, d_tx))
-                if not f_inf:
-                    for i in range(-3, 4):
-                        chk = d_tx + datetime.timedelta(days=i)
-                        if (tik, chk) in fee_map: f_inf = fee_map[(tik, chk)]; break
-                if f_inf and f_inf['q'] > 0: fee_val = f_inf['f'] / f_inf['q']
-                if gp > 0: sell_p = gp - fee_val
-                
-            deal_pl = 0
-            if tik in inv:
-                while rem > 0 and inv[tik]:
-                    batch = inv[tik][0]
-                    take = min(rem, batch['q'])
-                    d_held = (d - batch['d']).days
-                    if d_held < 0: d_held = 0
-                    days_sold_map[tik].append((d, d_held, take))
-                    
-                    if sell_p > 0: deal_pl += (sell_p - batch['p']) * take
-                    rem -= take
-                    batch['q'] -= take
-                    if batch['q'] <= 0: inv[tik].popleft()
-                if not inv[tik]: del inv[tik]
-                
-            if tik in cycles_active:
-                cycles_active[tik]['cur_q'] -= e['qty']
-                cycles_active[tik]['pl'] += deal_pl
-                if cycles_active[tik]['cur_q'] <= 0.1:
-                    cyc = cycles_active.pop(tik)
-                    dur = (d - cyc['start']).days
-                    roi = 0
-                    if cyc['cost'] > 0: roi = (cyc['pl'] / cyc['cost']) * 100
-                    cycles_closed.append({'Mã CK': tik, 'Ngày Bắt Đầu': cyc['start'], 'Ngày Kết Thúc': d, 
-                             'Tuổi Vòng Đời': max(1, dur), 'Tổng Vốn': cyc['cost'], 
-                             'Lãi/Lỗ': cyc['pl'], '% ROI': roi, 'Status': 'Đã tất toán'})
-
-    for tik, dat in cycles_active.items():
-        dur = (today - dat['start']).days
-        cycles_closed.append({'Mã CK': tik, 'Ngày Bắt Đầu': dat['start'], 'Ngày Kết Thúc': None, 
-                 'Tuổi Vòng Đời': dur, 'Tổng Vốn': dat['cost'], 'Lãi/Lỗ': dat['pl'], 'Status': 'Đang nắm giữ'})
-
+def get_app_definitions():
+    """
+    KHO CHỨA TOÀN BỘ CHÚ THÍCH & HƯỚNG DẪN SỬ DỤNG.
+    Sửa nội dung văn bản tại đây mà không ảnh hưởng logic code.
+    """
     return {
-        'raw_sales': raw_sales, 'cycles': cycles_closed, 'inventory': inv,
-        'capital_map': cap_map, 'days_sold_map': days_sold_map,
-        'total_deposit': total_deposit, 'deposit_debug': deposit_debug, 'msg': msg
+        # --- A. KPI TỔNG QUAN ---
+        "KPI": {
+            "DEPOSIT": "💰 Tổng Vốn Gốc (Net Deposit):\nLà tổng số tiền mặt thực tế bạn đã nạp vào tài khoản trừ đi số tiền đã rút ra.\nĐây là số tiền 'xương máu' ban đầu.",
+            "CASH": "💵 Tiền Mặt Khả Dụng (Buying Power):\nSố dư tiền mặt hiện tại có trong tài khoản có thể dùng để mua chứng khoán.\nChưa bao gồm tiền bán chờ về.",
+            "MKT_VAL": "📦 Giá Trị Thị Trường (Market Value):\nTổng giá trị của tất cả cổ phiếu đang nắm giữ tính theo giá khớp lệnh hiện tại (Real-time).\nDelta thể hiện Lãi/Lỗ tạm tính (Unrealized PnL).",
+            "NAV": "💎 Tài Sản Ròng (Net Asset Value):\nTổng giá trị tài sản thực tế = Tiền Mặt + Giá Trị Thị Trường Cổ Phiếu.\nCon số này cho biết bạn đang thực sự giàu lên hay nghèo đi.",
+            "PROFIT": "🚀 Tổng Lợi Nhuận (Total PnL):\nTổng lãi/lỗ 'All-in' bao gồm: (1) Lãi đã chốt + (2) Cổ tức tiền mặt + (3) Lãi tạm tính chưa chốt.\nĐây là con số cuối cùng đánh giá hiệu quả đầu tư.",
+            "HOLDING": "📊 Số Mã Đang Giữ:\nSố lượng mã cổ phiếu có số lượng > 0 trong danh mục."
+        },
+        
+        # --- B. CHÚ THÍCH CÁC TAB PHÂN TÍCH ---
+        "ANALYSIS": {
+            # Tab Chuyên Sâu
+            "WIN_RATE": "🎯 Tỷ Lệ Thắng (Win Rate):\nSố lệnh có lãi / Tổng số lệnh đã chốt.\n• Dưới 40%: Cần xem lại phương pháp chọn cổ phiếu.\n• Trên 60%: Rất tốt.",
+            "PROFIT_FACTOR": "⚖️ Profit Factor (PF):\nTổng Tiền Lãi / Tổng Tiền Lỗ.\n• PF < 1: Hệ thống đang thua lỗ.\n• PF > 1.5: Hệ thống ổn định.\n• PF > 3: Hệ thống xuất sắc.",
+            "AVG_WIN": "Tiền lãi trung bình kiếm được trong một lệnh thắng.",
+            "AVG_LOSS": "Tiền lỗ trung bình phải chịu trong một lệnh thua.",
+            
+            # Tab Tâm Lý
+            "PSY_TIMELINE": """
+            **Ý nghĩa:** Biểu đồ này giúp bạn phát hiện **Over-trading** (Giao dịch quá mức).
+            - Nếu thấy các điểm Mua/Bán dày đặc chi chít trong một khoảng thời gian ngắn -> Bạn đang bị tâm lý, giao dịch theo cảm xúc.
+            - Nếu các điểm rải đều và thưa -> Bạn giao dịch có kế hoạch.
+            """,
+            "PSY_MATRIX": """
+            **Cách đọc Ma Trận:**
+            - **Trục Ngang:** Thời gian nắm giữ (Ngày). Bên phải là giữ lâu, bên trái là lướt sóng.
+            - **Trục Dọc:** Lợi nhuận. Bên trên là Lãi, bên dưới là Lỗ.
+            - **Bong bóng:** Kích thước thể hiện số vốn bỏ ra.
+            👉 **Cảnh báo:** Hãy tìm những bong bóng **ĐỎ TO** nằm ở góc **DƯỚI BÊN PHẢI**. Đó là những khoản lỗ lớn mà bạn đã "gồng" quá lâu (Cố chấp).
+            """,
+            "PSY_INTENSITY": """
+            **Ý nghĩa:** So sánh giữa "Sức lực bỏ ra" (Số lệnh) và "Kết quả thu về" (Tiền lãi).
+            - **Tốt:** Cột thấp (ít lệnh) nhưng Đường xanh đi lên (Lãi tăng) -> Hiệu quả cao.
+            - **Xấu:** Cột cao vút (Mua bán liên tục) nhưng Đường xanh đi ngang hoặc cắm đầu -> Tốn phí thuế, không hiệu quả ("Quay phí").
+            """,
+            "PSY_STREAK": """
+            **Ý nghĩa:** Soi diễn biến tâm lý qua chuỗi Thắng/Thua.
+            - Sau một chuỗi thắng dài, bạn có xu hướng chủ quan và đi lệnh lớn (dễ mất hết lãi)?
+            - Sau một chuỗi thua, bạn có dừng lại nghỉ ngơi hay cố gỡ ngay lập tức?
+            """,
+
+            # Tab Rủi Ro
+            "RISK_HEATMAP": """
+            **Ý nghĩa:** Nhìn lại lịch sử để tìm ra "Chu kỳ sinh học" trong giao dịch.
+            - Bạn thường lãi đậm vào tháng mấy?
+            - Bạn hay bị "cắt tiết" vào giai đoạn nào?
+            👉 Giúp bạn biết khi nào nên "nghỉ chơi" đi du lịch.
+            """,
+            "RISK_DRAWDOWN": """
+            **Ý nghĩa:** Thước đo "Độ đau đớn" của tài khoản.
+            - Biểu đồ thể hiện mức sụt giảm của Tài sản ròng (NAV) so với **đỉnh cao nhất** từng thiết lập trước đó.
+            - **Max Drawdown:** Là điểm trũng sâu nhất. Nếu > 20%, hệ thống của bạn rủi ro cao, cần giảm quy mô vốn.
+            """
+        },
+
+        # --- C. CHÚ THÍCH CỘT DỮ LIỆU ---
+        "COLS": {
+            "Mã CK": st.column_config.TextColumn("Mã CK", width="small", help="Mã chứng khoán niêm yết."),
+            "Xu Hướng": st.column_config.TextColumn("Xu Hướng", width="small", help="Trạng thái lãi/lỗ hiện tại."),
+            "Vốn Gốc (Mua)": st.column_config.NumberColumn("Vốn Gốc", help="Tổng số tiền đã chi ra để mua số lượng cổ phiếu đang nắm giữ (Giá khớp * SL)."),
+            "Vốn Hợp Lý (Sau Cổ Tức)": st.column_config.NumberColumn("Vốn Hợp Lý", help="Vốn Gốc được điều chỉnh giảm đi tương ứng với số tiền cổ tức đã nhận.\nĐây là giá vốn thực tế để tính hòa vốn (Break-even)."),
+            "Tổng Vốn Mua": st.column_config.NumberColumn("Tổng Vốn Mua", help="Tổng quy mô vốn giải ngân cho một chu kỳ giao dịch (Deal)."),
+            "Tổng Vốn Đã Rót": st.column_config.NumberColumn("Tổng Vốn Đã Rót", help="Tổng tiền tích lũy đã từng mua mã này từ quá khứ đến nay."),
+            "🔄 Doanh Số Mua": st.column_config.NumberColumn("Doanh Số Mua", help="Tổng giá trị giao dịch chiều Mua (Vòng quay vốn)."),
+            "Tổng Lãi Thực": st.column_config.NumberColumn("Tổng Lãi Thực", help="Lợi nhuận đã hiện thực hóa (Realized): Lãi bán chốt lời + Cổ tức tiền mặt."),
+            "Lãi/Lỗ Giao Dịch": st.column_config.NumberColumn("Lãi/Lỗ GD", help="Chênh lệch giá (Capital Gain) từ các lệnh đã bán. Chưa tính cổ tức."),
+            "Cổ Tức Đã Nhận": st.column_config.NumberColumn("Cổ Tức", help="Tổng tiền mặt nhận được từ cổ tức."),
+            "Lãi/Lỗ": st.column_config.NumberColumn("Lãi/Lỗ", help="PnL ròng của chu kỳ/giao dịch."),
+            "Giá TT": st.column_config.NumberColumn("Giá TT", help="Giá khớp lệnh gần nhất trên thị trường (Cập nhật 60s/lần)."),
+            "Giá Trị TT": st.column_config.NumberColumn("Giá Trị TT", help="Thành tiền theo thị trường: SL Tồn * Giá TT."),
+            "Giá Trị TT (Live)": st.column_config.NumberColumn("Giá Trị TT (Live)", help="Tổng giá trị thị trường của mã này (Bao gồm tất cả các lô đang giữ)."),
+            "Lãi/Lỗ Tạm Tính": st.column_config.NumberColumn("Lãi/Lỗ Tạm", help="Lãi/Lỗ chưa chốt (Unrealized PnL): Giá Trị TT - Vốn Hợp Lý."),
+            "Chênh Lệch (Live)": st.column_config.NumberColumn("Chênh Lệch (Live)", help="So sánh Giá trị thị trường với Vốn Hợp Lý. Dương là Lãi thực tế."),
+            "% Hiệu Suất (Trade)": st.column_config.NumberColumn("% Hiệu Suất", format="%.2f %%", help="Tỷ suất lợi nhuận trên vốn đã bán."),
+            "% Lãi/Lỗ": st.column_config.NumberColumn("% Lãi/Lỗ", format="%.2f %%", help="Tỷ suất lợi nhuận tạm tính theo giá thị trường."),
+            "% ROI Cycle": st.column_config.NumberColumn("% ROI Cycle", format="%.2f %%", help="Tỷ suất sinh lời của chu kỳ đầu tư."),
+            "SL Đang Giữ": st.column_config.NumberColumn("SL Đang Giữ", format="%d", help="Khối lượng cổ phiếu khả dụng."),
+            "SL": st.column_config.NumberColumn("SL", format="%d", help="Khối lượng giao dịch."),
+            "Ngày Giữ TB (Đã Bán)": st.column_config.NumberColumn("Ngày Giữ TB", format="%.1f ngày", help="Thời gian nắm giữ trung bình của các lệnh đã bán."),
+            "Tuổi Kho TB": st.column_config.NumberColumn("Tuổi Kho TB", format="%.1f ngày", help="Thời gian nắm giữ trung bình của cổ phiếu trong kho."),
+            "Tuổi Vòng Đời": st.column_config.NumberColumn("Tuổi Vòng Đời", format="%d ngày", help="Số ngày từ lúc mở vị thế đến lúc đóng vị thế."),
+            "Vốn Kẹp": st.column_config.NumberColumn("Vốn Kẹp", help="Giá trị vốn đang bị kẹt trong cổ phiếu lỗ hoặc giữ quá lâu."),
+        }
     }
 
 # ==============================================================================
-# 5. UI TRIGGER & DISPLAY
+# 2. SETUP & STATE
 # ==============================================================================
-st.write("")
-btn_run = st.button("🚀 CHẠY PHÂN TÍCH NGAY", type="primary", use_container_width=True)
+st.set_page_config(page_title="Dashboard Quản Lý Đầu Tư", page_icon="📈", layout="wide")
+st.title("📊 Dashboard Phân Tích Hiệu Quả Đầu Tư")
+st.markdown("---")
+
+if 'data_processed' not in st.session_state:
+    st.session_state.data_processed = False
+    st.session_state.engine_vck = None
+    st.session_state.engine_vps = None
+    st.session_state.timeline_events = []
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_prices_cached(ticker_list):
+    return get_current_price_dict(ticker_list)
+
+# ==============================================================================
+# 3. SIDEBAR & LOGIC
+# ==============================================================================
+with st.sidebar:
+    st.header("📂 Nguồn Dữ Liệu")
+    file_vck = st.file_uploader("Upload File VCK (history_VCK.xlsx)", type=['xlsx'])
+    file_vps = st.file_uploader("Upload File VPS (history3.xlsx)", type=['xlsx'])
+    st.divider()
+    btn_run = st.button("🚀 CHẠY PHÂN TÍCH", type="primary", use_container_width=True)
+    
+    if st.session_state.data_processed:
+        if st.button("🔄 Cập Nhật Giá Thị Trường"):
+            fetch_live_prices_cached.clear()
+            st.rerun()
+        st.caption("Giá cập nhật mỗi 60s.")
 
 if btn_run:
-    if uploaded_file is None:
-        st.error("⚠️ Chưa có file!")
-    elif user_pl_col is None:
-        st.error("⚠️ Vui lòng chọn cột Lãi/Lỗ")
+    if not file_vck and not file_vps:
+        st.warning("⚠️ Vui lòng upload file dữ liệu.")
     else:
-        with st.spinner("Đang tính toán (V70)..."):
+        engine_vck = PortfolioEngine("VCK")
+        engine_vps = PortfolioEngine("VPS")
+        all_events = []
+        if file_vck:
             try:
-                raw_data = run_logic_v70(uploaded_file, user_pl_col)
-                st.session_state.data_raw = raw_data
-                st.session_state.has_run = True
-            except Exception as e:
-                st.error(f"Lỗi: {e}")
-                st.code(traceback.format_exc())
+                events = VCKAdapter().parse(file_vck)
+                for e in events: engine_vck.process_event(e)
+                all_events.extend(events)
+            except Exception as e: st.error(f"Lỗi VCK: {e}")
+        if file_vps:
+            try:
+                events = VPSAdapter().parse(file_vps)
+                for e in events: engine_vps.process_event(e)
+                all_events.extend(events)
+            except Exception as e: st.error(f"Lỗi VPS: {e}")
 
-# --- HIỂN THỊ KẾT QUẢ ---
-if st.session_state.has_run and st.session_state.data_raw:
-    raw = st.session_state.data_raw
-    st.success("✅ Đã xử lý xong!")
+        st.session_state.engine_vck = engine_vck
+        st.session_state.engine_vps = engine_vps
+        st.session_state.timeline_events = all_events
+        st.session_state.data_processed = True
+        st.rerun()
+
+# ==============================================================================
+# 4. MAIN DISPLAY
+# ==============================================================================
+if st.session_state.data_processed:
+    # Load Definitions
+    APP_DEFS = get_app_definitions()
+    KPI_TEXT = APP_DEFS["KPI"]
+    ANA_TEXT = APP_DEFS["ANALYSIS"]
+    COL_CFG = APP_DEFS["COLS"]
+
+    engine_vck = st.session_state.engine_vck
+    engine_vps = st.session_state.engine_vps
     
-    # ---------------------------------------------
-    # 1. HIỂN THỊ THÔNG TIN NẠP TIỀN (QUAN TRỌNG)
-    # ---------------------------------------------
-    total_dep_val = raw['total_deposit']
-    if total_dep_val == 0:
-        st.warning("⚠️ Không tìm thấy tiền nạp! Hãy kiểm tra lại.")
-        if raw['msg'] != "OK": st.error(raw['msg'])
-    else:
-        with st.expander(f"🔍 Chi tiết {len(raw['deposit_debug'])} lần nạp tiền (Tổng: {fmt_vn(total_dep_val)} VNĐ)"):
-            st.dataframe(pd.DataFrame(raw['deposit_debug']))
+    has_vck = (len(engine_vck.data) > 0 or len(engine_vck.trade_log) > 0)
+    has_vps = (len(engine_vps.data) > 0 or len(engine_vps.trade_log) > 0)
 
-    all_tk_global = set(list(raw['capital_map'].keys()) + list(raw['inventory'].keys()))
-    GLOBAL_TOTAL_HOLD_VAL = 0
-    hold_map_global = {}
-    today = datetime.date.today()
+    # --- REPORT GENERATION ---
+    df_s_vck, df_c_vck, df_i_vck, df_w_vck = engine_vck.generate_reports()
+    df_s_vps, df_c_vps, df_i_vps, df_w_vps = engine_vps.generate_reports()
+
+    # --- LIVE PRICE ---
+    tickers_vck = df_i_vck[df_i_vck['SL Tồn'] > 0]['Mã CK'].tolist() if not df_i_vck.empty else []
+    tickers_vps = df_i_vps[df_i_vps['SL Tồn'] > 0]['Mã CK'].tolist() if not df_i_vps.empty else []
+    all_tickers = list(set([str(t).strip().upper() for t in (tickers_vck + tickers_vps)]))
     
-    for tik in all_tk_global:
-        val_h = 0
-        if tik in raw['inventory']:
-            for b in raw['inventory'][tik]: val_h += b['q'] * b['p']
-        hold_map_global[tik] = val_h
-        GLOBAL_TOTAL_HOLD_VAL += val_h
+    live_prices = {}
+    if all_tickers:
+        with st.spinner("⏳ Đang cập nhật giá thị trường..."):
+            live_prices = fetch_live_prices_cached(all_tickers)
 
-    # FILTER
-    with st.sidebar:
-        st.write("---")
-        st.header("4. Lọc Mã Cổ Phiếu")
-        all_display_tk = sorted(list(all_tk_global))
-        selected_tickers = st.multiselect("Chọn mã:", all_display_tk)
+    with st.expander("🔍 Chẩn đoán kết nối dữ liệu (Debug)", expanded=False):
+        if live_prices:
+            st.success(f"✅ Đã lấy được giá của {len(live_prices)} mã.")
+            st.json(live_prices)
+        else:
+            st.warning("⚠️ Chưa lấy được giá. Kiểm tra lại kết nối mạng hoặc thư viện vnstock.")
+
+    # --- CALCULATION LOGIC ---
+    def calc_mkt(df_inv, prices):
+        if df_inv.empty: return 0, df_inv
+        df_inv['Key_Map'] = df_inv['Mã CK'].astype(str).str.strip().str.upper()
+        df_inv['Giá TT'] = df_inv['Key_Map'].map(prices).fillna(0)
+        df_inv['Giá Tính Toán'] = df_inv.apply(lambda x: x['Giá TT'] if x['Giá TT'] > 0 else x['Giá Vốn ĐC'], axis=1)
+        df_inv['Giá Trị TT'] = df_inv['SL Tồn'] * df_inv['Giá Tính Toán']
+        df_inv['Lãi/Lỗ Tạm Tính'] = df_inv['Giá Trị TT'] - (df_inv['SL Tồn'] * df_inv['Giá Vốn ĐC'])
+        df_inv['% Lãi/Lỗ'] = df_inv.apply(lambda x: (x['Lãi/Lỗ Tạm Tính'] / (x['SL Tồn'] * x['Giá Vốn ĐC']) * 100) if (x['SL Tồn'] * x['Giá Vốn ĐC']) != 0 else 0, axis=1)
+        return df_inv['Giá Trị TT'].sum(), df_inv
+
+    def enrich_summary_with_mkt(df_sum, df_inv):
+        if df_sum.empty or df_inv.empty: return df_sum
+        mkt_values = df_inv.groupby('Mã CK')['Giá Trị TT'].sum()
+        df_sum['Giá Trị TT (Live)'] = df_sum['Mã CK'].map(mkt_values).fillna(0)
+        df_sum['Chênh Lệch (Live)'] = df_sum.apply(lambda x: (x['Giá Trị TT (Live)'] - x['Vốn Hợp Lý (Sau Cổ Tức)']) if x['SL Đang Giữ'] > 0 else 0, axis=1)
+        return df_sum
+
+    val_mkt_vck, df_i_vck = calc_mkt(df_i_vck, live_prices)
+    val_mkt_vps, df_i_vps = calc_mkt(df_i_vps, live_prices)
+    df_s_vck = enrich_summary_with_mkt(df_s_vck, df_i_vck)
+    df_s_vps = enrich_summary_with_mkt(df_s_vps, df_i_vps)
+
+    # --- KPI GLOBAL ---
+    total_dep = engine_vck.total_deposit + engine_vps.total_deposit
+    total_prof = engine_vck.total_profit + engine_vps.total_profit
+    total_cash = engine_vps.real_cash_balance + engine_vck.real_cash_balance
+    total_mkt_val = val_mkt_vck + val_mkt_vps
+    unrealized_pnl = (df_i_vck['Lãi/Lỗ Tạm Tính'].sum() if not df_i_vck.empty else 0) + \
+                     (df_i_vps['Lãi/Lỗ Tạm Tính'].sum() if not df_i_vps.empty else 0)
+    real_nav = total_cash + total_mkt_val
+    act_cnt = (len(df_s_vck[df_s_vck['SL Đang Giữ']>0]) if not df_s_vck.empty else 0) + \
+              (len(df_s_vps[df_s_vps['SL Đang Giữ']>0]) if not df_s_vps.empty else 0)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("💰 Tổng Tiền Đã Nạp", fmt_vnd(total_dep), help=KPI_TEXT["DEPOSIT"])
+    c2.metric("💵 Tiền Mặt Đang Có", fmt_vnd(total_cash), help=KPI_TEXT["CASH"])
+    c3.metric("📦 Giá Trị Kho (TT)", fmt_vnd(total_mkt_val), delta=fmt_vnd(unrealized_pnl), delta_color="normal", help=KPI_TEXT["MKT_VAL"])
+    c4.metric("💎 NAV Thực Tế", fmt_vnd(real_nav), help=KPI_TEXT["NAV"])
+    total_all = total_prof + unrealized_pnl
+    c5.metric("🚀 Tổng Hiệu Quả", fmt_vnd(total_all), delta=f"{(total_all/total_dep*100):.1f}%" if total_dep!=0 else "0%", help=KPI_TEXT["PROFIT"])
+
+    st.divider()
+    
+    # --- NAV CHART ---
+    df_history_global = pd.DataFrame() 
+    if st.session_state.timeline_events:
+        tm = TimeMachine(st.session_state.timeline_events)
+        df_history_global = tm.run()
+        if not df_history_global.empty:
+            st.plotly_chart(draw_nav_growth_chart(df_history_global), use_container_width=True, key="nav_main")
+
+    st.divider()
+
+    # --- DISPLAY ACC FUNCTION ---
+    def display_acc(engine, title, df_sum, df_cyc, df_inv, df_warn, df_hist):
+        st.markdown(f"## 🏦 {title}")
+        if df_sum.empty: return
+
+        # Overview Charts
+        c1, c2 = st.columns(2)
+        with c1:
+            df_h = df_sum[df_sum['Vốn Gốc (Mua)'] > 0]
+            if not df_h.empty: st.plotly_chart(px.pie(df_h, values='Vốn Gốc (Mua)', names='Mã CK', title='Phân Bổ Vốn', hole=0.4), use_container_width=True, key=f"p1_{title}")
+        with c2:
+            df_p = df_sum.sort_values(by='Tổng Lãi Thực', ascending=False).head(10)
+            if not df_p.empty:
+                st.plotly_chart(px.bar(df_p, x='Mã CK', y='Tổng Lãi Thực', title='Top Hiệu Quả', text_auto='.2s', color_discrete_sequence=['#00CC96']), use_container_width=True, key=f"p2_{title}")
+
+        # TABS
+        t_adv, t_psy, t_risk, t1, t2, t3, t4, t5 = st.tabs(["🧠 PT Chuyên Sâu", "❤️ Tâm Lý", "🛡️ Quản Trị Rủi Ro", "📋 Hiệu Suất Tổng", "🔄 Lịch Sử Cycle", "📦 Chi Tiết Kho (Live)", "⚠️ Cảnh Báo", "🔍 Soi Lỗi"])
         
-    df_sales = pd.DataFrame(raw['raw_sales'])
-    if not df_sales.empty:
-        df_sales['Ngày Bán'] = pd.to_datetime(df_sales['Ngày Bán']).dt.date
-        if filter_type == "Tùy chỉnh ngày":
-            df_sales = df_sales[(df_sales['Ngày Bán'] >= start_date) & (df_sales['Ngày Bán'] <= end_date)]
-        if selected_tickers:
-            df_sales = df_sales[df_sales['Mã CK'].isin(selected_tickers)]
+        # 1. PT Chuyên Sâu
+        with t_adv:
+            closed = engine.get_all_closed_cycles()
+            if closed:
+                kpi = calculate_kpi(closed)
+                if kpi:
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Win Rate", f"{kpi['win_rate']}%", help=ANA_TEXT["WIN_RATE"])
+                    k2.metric("Profit Factor", f"{kpi['profit_factor']}", help=ANA_TEXT["PROFIT_FACTOR"])
+                    k3.metric("Avg Win", fmt_vnd(kpi['avg_win']), help=ANA_TEXT["AVG_WIN"])
+                    k4.metric("Avg Loss", fmt_vnd(kpi['avg_loss']), help=ANA_TEXT["AVG_LOSS"])
+                    st.divider()
+                    cc1, cc2, cc3 = st.columns([1,1,2])
+                    with cc1: st.plotly_chart(draw_win_rate_pie(kpi), use_container_width=True, key=f"w_{title}")
+                    with cc2: st.plotly_chart(draw_risk_reward_bar(kpi), use_container_width=True, key=f"rr_{title}")
+                    with cc3: st.plotly_chart(draw_pnl_distribution(pd.DataFrame(closed)), use_container_width=True, key=f"pnl_{title}")
+                    st.plotly_chart(draw_efficiency_scatter(pd.DataFrame(closed)), use_container_width=True, key=f"eff_{title}")
+            else: st.info("Chưa có lệnh tất toán.")
+
+        # 2. Tâm Lý (Có giải thích)
+        with t_psy:
+            st.markdown("#### 🧘 Phân Tích Tâm Lý")
+            atype = st.selectbox("Góc nhìn:", ["1. Nhịp Tim", "2. Ma Trận Kỷ Luật", "3. Cường Độ vs Hiệu Quả", "4. Chuỗi"], key=f"psy_{title}")
             
-    df_cycles = pd.DataFrame(raw['cycles'])
-    if not df_cycles.empty:
-        if selected_tickers:
-            df_cycles = df_cycles[df_cycles['Mã CK'].isin(selected_tickers)]
-        if filter_type == "Tùy chỉnh ngày":
-            def f_cyc(row):
-                if row['Status'] == 'Đã tất toán':
-                    d_end = safe_date(row['Ngày Kết Thúc'])
-                    if d_end: return start_date <= d_end <= end_date
-                return True 
-            df_cycles = df_cycles[df_cycles.apply(f_cyc, axis=1)]
+            if "1. Nhịp Tim" in atype:
+                st.info(ANA_TEXT["PSY_TIMELINE"])
+                if engine.trade_log:
+                    fig = draw_trading_timeline(engine.trade_log)
+                    if fig: st.plotly_chart(fig, use_container_width=True, key=f"tline_{title}")
+            elif "2. Ma Trận" in atype:
+                st.info(ANA_TEXT["PSY_MATRIX"])
+                closed = engine.get_all_closed_cycles()
+                if closed:
+                    fig = draw_discipline_matrix(closed)
+                    if fig: st.plotly_chart(fig, use_container_width=True, key=f"mat_{title}")
+            elif "3. Cường Độ" in atype:
+                st.info(ANA_TEXT["PSY_INTENSITY"])
+                closed = engine.get_all_closed_cycles()
+                if engine.trade_log:
+                    fig = draw_efficiency_vs_intensity(engine.trade_log, closed)
+                    if fig: st.plotly_chart(fig, use_container_width=True, key=f"int_{title}")
+            elif "4. Chuỗi" in atype:
+                st.info(ANA_TEXT["PSY_STREAK"])
+                closed = engine.get_all_closed_cycles()
+                if closed:
+                    fig = draw_streak_analysis(closed)
+                    if fig: st.plotly_chart(fig, use_container_width=True, key=f"str_{title}")
 
-    inv_rows = []
-    for t, q in raw['inventory'].items():
-        if selected_tickers and t not in selected_tickers: continue
-        for b in q:
-            inv_rows.append({'Mã CK': t, 'Ngày Mua': b['d'], 'SL Tồn': b['q'], 'Giá Vốn': b['p']})
-    df_inv = pd.DataFrame(inv_rows)
+        # 3. Quản Trị Rủi Ro (Có giải thích)
+        with t_risk:
+            st.markdown("#### 🛡️ Quản Trị Rủi Ro")
+            
+            st.markdown("##### 1. Bản Đồ Nhiệt Hiệu Quả")
+            with st.expander("ℹ️ Giải thích ý nghĩa"):
+                st.markdown(ANA_TEXT["RISK_HEATMAP"])
+            if engine.trade_log:
+                fig_heat = draw_pnl_heatmap(engine.trade_log)
+                if fig_heat: st.plotly_chart(fig_heat, use_container_width=True, key=f"heat_{title}")
+            
+            st.divider()
+            
+            st.markdown("##### 2. Sụt Giảm Vốn Thực (Realized Drawdown)")
+            with st.expander("ℹ️ Giải thích ý nghĩa"):
+                st.markdown(ANA_TEXT["RISK_DRAWDOWN"])
+            if not df_hist.empty:
+                fig_dd, max_dd, curr_dd = draw_realized_drawdown(df_hist)
+                if fig_dd:
+                    k1, k2 = st.columns(2)
+                    k1.metric("Max Drawdown", f"{max_dd:.2f}%")
+                    k2.metric("Current Drawdown", f"{curr_dd:.2f}%")
+                    st.plotly_chart(fig_dd, use_container_width=True, key=f"dd_{title}")
 
-    agg_sales = {}
-    if not df_sales.empty:
-        agg_sales = df_sales.groupby('Mã CK').agg({'SL Bán':'sum','Vốn Bán':'sum','Lãi/Lỗ':'sum'}).to_dict('index')
-    
-    final_rows = []
-    warn_rows = []
-    display_tickers = selected_tickers if selected_tickers else all_tk_global
-    
-    for tik in display_tickers:
-        q_hold = 0; d_sum = 0
-        if tik in raw['inventory']:
-            for b in raw['inventory'][tik]:
-                q_hold += b['q']
-                d_sum += (today - b['d']).days * b['q']
-        
-        avg_d_hold = d_sum/q_hold if q_hold > 0 else 0
-        val_hold = hold_map_global.get(tik, 0)
-        s_inf = agg_sales.get(tik, {'SL Bán':0, 'Vốn Bán':0, 'Lãi/Lỗ':0})
-        
-        sold_list = raw['days_sold_map'].get(tik, [])
-        d_sold_s = 0; q_sold_s = 0
-        for d_sell, days, q in sold_list:
-            is_in_time = True
-            if filter_type == "Tùy chỉnh ngày":
-                d_sell_date = safe_date(d_sell)
-                if d_sell_date and not (start_date <= d_sell_date <= end_date): is_in_time = False
-            if is_in_time:
-                d_sold_s += days * q
-                q_sold_s += q
-        
-        avg_d_sold = 0
-        if q_sold_s > 0: avg_d_sold = d_sold_s / q_sold_s
-        pct_eff = (s_inf['Lãi/Lỗ']/s_inf['Vốn Bán']*100) if s_inf['Vốn Bán'] > 0 else 0
-        
-        final_rows.append({
-            'Mã CK': tik, 'Lãi/Lỗ (Trong Kỳ)': s_inf['Lãi/Lỗ'], '% Hiệu Suất (Trong Kỳ)': pct_eff,
-            'SL Đang Giữ': q_hold, 'Vốn Đang Giữ': val_hold, 'Tuổi Kho TB': avg_d_hold, 'Ngày Giữ TB (Bán)': avg_d_sold
-        })
-        
-        w = []
-        alloc = 0
-        if GLOBAL_TOTAL_HOLD_VAL > 0: alloc = val_hold / GLOBAL_TOTAL_HOLD_VAL
-        if alloc > LIMIT_ALLOC: w.append(f"Tỷ trọng {round(alloc*100,1)}%")
-        if val_hold > LIMIT_CAP: w.append("Vốn lớn")
-        if avg_d_hold > LIMIT_DAYS: w.append(f"Kẹp > {LIMIT_DAYS} ngày")
-        if w: warn_rows.append({'Mã CK': tik, 'Vốn': val_hold, 'Cảnh Báo': "; ".join(w)})
+        # --- TABLES ---
+        with t1: 
+            df_display = df_sum.rename(columns={'Tổng Vốn Đã Rót': '🔄 Doanh Số Mua'})
+            cols = list(df_display.columns)
+            if 'Vốn Hợp Lý (Sau Cổ Tức)' in cols and 'Giá Trị TT (Live)' in cols:
+                idx = cols.index('Vốn Hợp Lý (Sau Cổ Tức)')
+                cols.insert(idx + 1, cols.pop(cols.index('Giá Trị TT (Live)')))
+                cols.insert(idx + 2, cols.pop(cols.index('Chênh Lệch (Live)')))
+                df_display = df_display[cols]
 
-    df_final = pd.DataFrame(final_rows)
-    if not df_final.empty: df_final = df_final.sort_values('Vốn Đang Giữ', ascending=False)
-    df_warn = pd.DataFrame(warn_rows)
+            limit = 1000
+            cols_to_color = ['Tổng Lãi Thực', 'Chênh Lệch (Live)']
+            if not df_display.empty:
+                max_val = 0
+                for c in cols_to_color:
+                    if c in df_display.columns:
+                        m = df_display[c].abs().max()
+                        if m > max_val: max_val = m
+                if max_val > 0: limit = max_val
 
-    if not df_cycles.empty:
-        df_cycles = format_date_vn(df_cycles, 'Ngày Bắt Đầu')
-        df_cycles = format_date_vn(df_cycles, 'Ngày Kết Thúc')
-    if not df_inv.empty:
-        df_inv = format_date_vn(df_inv, 'Ngày Mua')
+            st.dataframe(
+                df_display.style.format({
+                    'Tổng SL Đã Bán': fmt_num, 'Lãi/Lỗ Giao Dịch': fmt_vnd, 'Cổ Tức Đã Nhận': fmt_vnd, 'Tổng Lãi Thực': fmt_vnd,
+                    '% Hiệu Suất (Trade)': fmt_pct, 'SL Đang Giữ': fmt_num, 'Vốn Gốc (Mua)': fmt_vnd, 'Vốn Hợp Lý (Sau Cổ Tức)': fmt_vnd,
+                    '🔄 Doanh Số Mua': fmt_vnd, '% Tỷ Trọng Vốn': fmt_pct, 'Ngày Giữ TB (Đã Bán)': fmt_float, 'Tuổi Kho TB': fmt_float,
+                    'Giá Trị TT (Live)': fmt_vnd, 'Chênh Lệch (Live)': fmt_vnd
+                })
+                .background_gradient(subset=[c for c in cols_to_color if c in df_display.columns], cmap='RdYlGn', vmin=-limit, vmax=limit), 
+                use_container_width=True, column_config=COL_CFG
+            )
 
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine='xlsxwriter') as wr:
-        df_final.to_excel(wr, sheet_name='HIỆU SUẤT', index=False)
-        if not df_inv.empty: df_inv.to_excel(wr, sheet_name='TỒN KHO', index=False)
-        if not df_cycles.empty: df_cycles.to_excel(wr, sheet_name='LỊCH SỬ', index=False)
-        if not df_warn.empty: df_warn.to_excel(wr, sheet_name='CẢNH BÁO', index=False)
-    
-    st.download_button("📥 Tải Excel (DD/MM/YYYY)", bio.getvalue(), "Bao_cao_V70.xlsx")
-    
-    m1, m2, m3 = st.columns(3)
-    t_pl = df_final['Lãi/Lỗ (Trong Kỳ)'].sum()
-    current_show_val = df_final['Vốn Đang Giữ'].sum()
-    
-    m1.metric("💰 TỔNG TIỀN ĐÃ NẠP", fmt_vn(total_dep_val) + " VNĐ")
-    m2.metric(f"Lãi/Lỗ ({start_date.strftime('%d/%m')} - {end_date.strftime('%d/%m')})", fmt_vn(t_pl) + " VNĐ", delta_color="normal" if t_pl>=0 else "inverse")
-    m3.metric(f"Vốn Đang Giữ (Hiển thị / Tổng)", f"{fmt_vn(current_show_val)} / {fmt_vn(GLOBAL_TOTAL_HOLD_VAL)} VNĐ")
-    
-    st.markdown("---")
-    c_chart1, c_chart2 = st.columns(2)
-    with c_chart1:
-        st.subheader("💰 Phân Bổ Vốn")
-        if not df_final.empty and current_show_val > 0:
-            df_c1 = df_final[df_final['Vốn Đang Giữ'] > 0].set_index('Mã CK')
-            st.bar_chart(df_c1['Vốn Đang Giữ'], color="#FF4B4B")
-        else: st.info("Không có dữ liệu vốn.")
+        with t2: st.dataframe(df_cyc.style.format({
+                'Tổng Vốn Mua': fmt_vnd, 'Lãi Giao Dịch': fmt_vnd, 'Cổ Tức': fmt_vnd, 
+                'Tổng Lãi Cycle': fmt_vnd, '% ROI Cycle': fmt_pct, 'Tuổi Vòng Đời': fmt_num
+            }), use_container_width=True, column_config=COL_CFG)
         
-    with c_chart2:
-        st.subheader("📈 Hiệu Quả (Trong Kỳ)")
-        if not df_final.empty:
-            df_c2 = df_final.set_index('Mã CK')
-            st.bar_chart(df_c2['Lãi/Lỗ (Trong Kỳ)'])
-    
-    st.markdown("---")
-    
-    df_final_show = apply_format_df(df_final)
-    df_inv_show = apply_format_df(df_inv)
-    df_cycles_show = apply_format_df(df_cycles)
-    df_warn_show = apply_format_df(df_warn)
-    
-    t1, t2, t3, t4 = st.tabs(["📊 Hiệu Suất", "📦 Chi Tiết Tồn Kho", "🔄 Lịch Sử Vòng Đời", "⚠️ Cảnh Báo"])
-    with t1: st.dataframe(df_final_show, use_container_width=True)
-    with t2: 
-        if not df_inv_show.empty: st.dataframe(df_inv_show, use_container_width=True)
-        else: st.info("Không có hàng tồn kho cho các mã đã chọn.")
-    with t3: st.dataframe(df_cycles_show, use_container_width=True)
-    with t4: st.dataframe(df_warn_show, use_container_width=True)
+        with t3: 
+            limit = 1000
+            if not df_inv.empty and 'Lãi/Lỗ Tạm Tính' in df_inv.columns:
+                max_abs = df_inv['Lãi/Lỗ Tạm Tính'].abs().max()
+                if max_abs > 0: limit = max_abs
+            
+            cols = [c for c in df_inv.columns if c not in ['Key_Map', 'Giá Tính Toán', 'Xu Hướng']]
+            
+            st.dataframe(
+                df_inv[cols].style.format({
+                    'SL Tồn': fmt_num, 'Giá Vốn Gốc': fmt_vnd, 'Giá Vốn ĐC': fmt_vnd, 
+                    'Giá TT': fmt_vnd, 'Giá Trị TT': fmt_vnd, 'Lãi/Lỗ Tạm Tính': fmt_vnd,
+                    '% Lãi/Lỗ': fmt_pct
+                }).background_gradient(subset=['Lãi/Lỗ Tạm Tính'], cmap='RdYlGn', vmin=-limit, vmax=limit),
+                use_container_width=True, column_config=COL_CFG
+            )
+            
+        with t4: 
+            if not df_warn.empty: 
+                st.dataframe(df_warn.style.format({'Vốn Kẹp': fmt_vnd, 'Tuổi Kho TB': fmt_float}), use_container_width=True, column_config=COL_CFG)
+            else: st.success("An toàn.")
+        with t5:
+            if engine.trade_log: 
+                st.dataframe(pd.DataFrame(engine.trade_log).style.format({
+                    'SL': fmt_num, 'Giá Bán': fmt_vnd, 'Giá Vốn': fmt_vnd, 'Lãi/Lỗ': fmt_vnd
+                }), use_container_width=True, column_config=COL_CFG)
+
+    if has_vck: display_acc(engine_vck, "Tài Khoản VCK", df_s_vck, df_c_vck, df_i_vck, df_w_vck, df_history_global)
+    if has_vps: display_acc(engine_vps, "Tài Khoản VPS", df_s_vps, df_c_vps, df_i_vps, df_w_vps, df_history_global)
+
+else:
+    st.info("👋 Chào mừng! Vui lòng upload file dữ liệu.")
