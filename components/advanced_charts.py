@@ -1,119 +1,215 @@
 # File: components/advanced_charts.py
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
+import numpy as np
 import streamlit as st
 
-# --- 1. BIỂU ĐỒ SỤT GIẢM VỐN THỰC (REALIZED DRAWDOWN) ---
-def draw_realized_drawdown(history_df):
+# --- HÀM TIỆN ÍCH TÌM CỘT THÔNG MINH ---
+def find_col(df, candidates):
     """
-    Vẽ biểu đồ mức độ sụt giảm của Tài sản ròng (NAV) so với đỉnh cao nhất trong quá khứ.
-    Lưu ý: Đây là sụt giảm THỰC TẾ (do cắt lỗ hoặc rút tiền), không phải sụt giảm tạm thời do thị trường.
+    Tìm tên cột trong DataFrame (Không phân biệt hoa thường).
+    Ưu tiên 1: Khớp chính xác.
+    Ưu tiên 2: Chứa từ khóa.
     """
-    if history_df is None or history_df.empty:
-        return None
+    if df is None or df.empty: return None
     
-    try:
-        df = history_df.copy()
-        
-        # Đảm bảo dữ liệu được sắp xếp theo thời gian
-        df = df.sort_values('Ngày')
-        
-        # 1. Tính đỉnh cao nhất tích lũy (Cumulative Max)
-        df['Peak'] = df['Tổng Tài Sản (NAV)'].cummax()
-        
-        # 2. Tính Drawdown (%)
-        # Công thức: (NAV hiện tại - Đỉnh cao nhất) / Đỉnh cao nhất
-        df['Drawdown'] = (df['Tổng Tài Sản (NAV)'] - df['Peak']) / df['Peak'] * 100
-        
-        # Tìm mức sụt giảm sâu nhất (Max Drawdown)
-        max_dd = df['Drawdown'].min()
-        current_dd = df['Drawdown'].iloc[-1]
+    cols = df.columns.tolist()
+    cols_lower = [c.lower() for c in cols]
+    
+    # 1. Tìm khớp chính xác
+    for cand in candidates:
+        cand_lower = cand.lower()
+        if cand_lower in cols_lower:
+            return cols[cols_lower.index(cand_lower)]
+    
+    # 2. Tìm chứa từ khóa (Partial match)
+    for cand in candidates:
+        cand_lower = cand.lower()
+        for i, col_lower in enumerate(cols_lower):
+            if cand_lower in col_lower:
+                return cols[i]
+    return None
 
-        # 3. Vẽ biểu đồ vùng (Area Chart)
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=df['Ngày'], 
-            y=df['Drawdown'],
-            mode='lines',
-            fill='tozeroy', # Tô màu vùng từ đường biểu đồ tới trục 0
-            name='Sụt Giảm (%)',
-            line=dict(color='#EF553B', width=1.5), # Màu đỏ cam cảnh báo
-            fillcolor='rgba(239, 85, 59, 0.2)',    # Màu nền đỏ nhạt
-            hovertemplate="Ngày: %{x}<br>Sụt giảm: %{y:.2f}%<extra></extra>"
-        ))
-
-        fig.update_layout(
-            title=f"📉 Sụt Giảm Vốn Thực (Max Drawdown: {max_dd:.2f}%)",
-            xaxis_title="",
-            yaxis_title="Mức Sụt Giảm Từ Đỉnh (%)",
-            height=400,
-            hovermode="x unified"
-        )
-        
-        # Format trục Y thêm dấu %
-        fig.update_yaxes(ticksuffix="%")
-        
-        return fig, max_dd, current_dd
-
-    except Exception as e:
-        st.error(f"Lỗi vẽ Drawdown: {e}")
-        return None, 0, 0
-
-# --- 2. BẢN ĐỒ NHIỆT HIỆU QUẢ (TRADING HEATMAP) ---
+# ==============================================================================
+# 1. BẢN ĐỒ NHIỆT HIỆU QUẢ (MONTHLY SEASONALITY)
+# ==============================================================================
 def draw_pnl_heatmap(trade_log):
     """
-    Vẽ biểu đồ phân bố Lãi/Lỗ theo thời gian để soi thói quen/phong độ.
-    Dạng: Scatter Plot theo dòng thời gian, màu sắc thể hiện Lãi/Lỗ.
+    Vẽ Heatmap Lãi/Lỗ theo Tháng/Năm.
+    Ý nghĩa: Giúp nhận diện "Mùa gặt" (Tháng thường lãi) và "Mùa đói" (Tháng thường lỗ).
     """
     if not trade_log: return None
-    
     try:
         df = pd.DataFrame(trade_log)
         
-        # 1. Chuẩn hóa dữ liệu
-        col_map = {'date': 'Ngày', 'Lãi/Lỗ': 'PnL'}
-        for k, v in col_map.items():
-            if k in df.columns: df[v] = df[k]
-            
-        # Chỉ lấy các lệnh có phát sinh Lãi/Lỗ thực (Bán, Cổ tức)
-        # Bỏ qua các dòng Lãi/Lỗ = 0 (Lệnh Mua)
-        df = df[df['Lãi/Lỗ'] != 0].copy()
+        # Tìm cột (Khớp với trade_log trong engine.py)
+        date_col = find_col(df, ['Ngày', 'date', 'time'])
+        pnl_col = find_col(df, ['Lãi/Lỗ', 'pnl', 'profit', 'amount'])
+        
+        if not date_col or not pnl_col: return None
+        
+        # Xử lý dữ liệu
+        df['date_norm'] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
+        df = df.dropna(subset=['date_norm'])
+        
+        # Chỉ lấy các dòng có phát sinh lãi/lỗ thực (loại bỏ các dòng chỉ có Mua)
+        df = df[df[pnl_col] != 0]
         
         if df.empty: return None
+
+        # Pivot Table: Năm (Hàng) x Tháng (Cột)
+        df['Year'] = df['date_norm'].dt.year
+        df['Month'] = df['date_norm'].dt.month
+        pivot = df.groupby(['Year', 'Month'])[pnl_col].sum().unstack(fill_value=0)
         
-        df['Ngày'] = pd.to_datetime(df['Ngày'])
-        df['Tháng'] = df['Ngày'].dt.strftime('%Y-%m')
+        # Fill đủ 12 tháng để biểu đồ đẹp
+        for m in range(1, 13):
+            if m not in pivot.columns: pivot[m] = 0
+        pivot = pivot[sorted(pivot.columns)]
+        pivot = pivot.sort_index(ascending=False) # Năm mới nhất lên trên
+
+        # Chuẩn bị dữ liệu vẽ
+        z = pivot.values
+        x = [f"Tháng {m}" for m in pivot.columns]
+        y = pivot.index.astype(str)
         
-        # 2. Vẽ biểu đồ
-        # Xanh = Lãi, Đỏ = Lỗ
-        # Kích thước chấm = Độ lớn của tiền (càng to càng rõ)
-        
-        fig = px.scatter(
-            df,
-            x="Ngày",
-            y="Lãi/Lỗ",
-            color="Lãi/Lỗ",
-            size=df['Lãi/Lỗ'].abs(), # Kích thước theo giá trị tuyệt đối
-            size_max=30,             # Giới hạn kích thước bong bóng
-            hover_data={'Ngày': True, 'Lãi/Lỗ': True, 'Mã': True, 'Loại': True},
-            color_continuous_scale=['#FF2B2B', '#F3F4F6', '#00CC96'], # Đỏ - Xám - Xanh
-            title="📅 Bản Đồ Nhiệt: Lịch Sử Chốt Lời & Cắt Lỗ"
-        )
+        # Format hiển thị rút gọn (cho ô bé)
+        def format_val(v):
+            if v == 0: return "" # Ô trống cho gọn
+            if abs(v) >= 1e9: return f"{v/1e9:.1f}B"
+            if abs(v) >= 1e6: return f"{v/1e6:.1f}M"
+            return f"{v/1e3:.0f}k"
+            
+        # Format hiển thị đầy đủ (cho Tooltip)
+        def format_full(v): return f"{v:,.0f} đ"
+
+        text_display = [[format_val(v) for v in row] for row in z]
+        text_hover = [[format_full(v) for v in row] for row in z]
+
+        # Vẽ biểu đồ
+        fig = go.Figure(data=go.Heatmap(
+            z=z, x=x, y=y,
+            text=text_display,
+            customdata=text_hover, # Dữ liệu ẩn dùng cho tooltip
+            texttemplate="%{text}", # Hiển thị text rút gọn trên ô
+            
+            # [CHÚ THÍCH CHI TIẾT]
+            hovertemplate=(
+                "<b>📅 Thời gian: %{x}/%{y}</b><br>" +
+                "💰 Lợi nhuận: <b>%{customdata}</b><br>" +
+                "<i>(Xanh = Lãi, Đỏ = Lỗ)</i>" +
+                "<extra></extra>"
+            ),
+            
+            colorscale='RdYlGn', # Red-Yellow-Green
+            zmid=0, # Căn giữa tại 0 để phân biệt rõ Lãi/Lỗ
+            showscale=True,
+            colorbar=dict(title="Lãi/Lỗ (VND)")
+        ))
         
         fig.update_layout(
-            height=450,
-            xaxis_title="Thời Gian",
-            yaxis_title="Số Tiền (VND)",
-            coloraxis_showscale=False # Ẩn thanh màu cho gọn
+            title="Bản Đồ Hiệu Quả Theo Tháng (Seasonality)",
+            height=300 + (len(y) * 40), # Chiều cao tự động
+            margin=dict(t=40, b=20, l=0, r=0),
+            xaxis_title="",
+            yaxis_title=""
+        )
+        return fig
+    except: return None
+
+# ==============================================================================
+# 2. BIỂU ĐỒ SỤT GIẢM (UNDERWATER DRAWDOWN)
+# ==============================================================================
+def draw_realized_drawdown(df_history):
+    """
+    Vẽ biểu đồ vùng ngập nước (Underwater).
+    Ý nghĩa: Đo lường rủi ro. Cho biết tài khoản đang 'bốc hơi' bao nhiêu % so với đỉnh cao nhất lịch sử.
+    """
+    if df_history is None or df_history.empty: return None, 0, 0
+    
+    try:
+        # 1. Tìm cột (Khớp với TimeMachine: 'Ngày', 'Tổng Tài Sản (NAV)')
+        date_col = find_col(df_history, ['Ngày', 'date', 'time'])
+        nav_col = find_col(df_history, [
+            'Tổng Tài Sản (NAV)', # Key chính xác từ TimeMachine
+            'Tổng Tài Sản', 'nav', 'total_nav', 'equity'
+        ])
+        
+        if not date_col or not nav_col: 
+            return None, 0, 0
+        
+        # 2. Xử lý dữ liệu
+        df = df_history.copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=[date_col]).sort_values(date_col)
+        df[nav_col] = pd.to_numeric(df[nav_col], errors='coerce').fillna(0)
+        
+        if df.empty: return None, 0, 0
+        
+        # 3. Tính toán Drawdown
+        # Peak: Đỉnh cao nhất tính đến thời điểm t
+        df['Peak'] = df[nav_col].cummax()
+        
+        # Drawdown: Chênh lệch so với đỉnh
+        # Xử lý chia cho 0: Nếu Peak=0 (tài khoản chưa nạp tiền), drawdown = 0
+        df['DrawdownPct'] = np.where(
+            df['Peak'] > 0, 
+            ((df[nav_col] - df['Peak']) / df['Peak']) * 100, 
+            0
         )
         
-        # Thêm đường tham chiếu 0
-        fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
+        # Chỉ số
+        current_dd = df['DrawdownPct'].iloc[-1]
+        max_dd = df['DrawdownPct'].min()
+
+        # 4. Vẽ biểu đồ
+        fig = go.Figure()
         
-        return fig
+        # Vẽ vùng sụt giảm (Màu đỏ nhạt)
+        fig.add_trace(go.Scatter(
+            x=df[date_col], 
+            y=df['DrawdownPct'],
+            fill='tozeroy', # Tô màu từ đường biểu diễn đến trục 0
+            mode='lines',
+            line=dict(color='#EF553B', width=1.5),
+            fillcolor='rgba(239, 85, 59, 0.2)',
+            name='Sụt Giảm',
+            
+            # [CHÚ THÍCH CHI TIẾT]
+            hovertemplate=(
+                "<b>📅 Ngày: %{x|%d/%m/%Y}</b><br>" +
+                "📉 Đang âm: <b>%{y:.2f}%</b> so với đỉnh<br>" +
+                "<i>(Càng sâu càng nguy hiểm)</i>" +
+                "<extra></extra>"
+            )
+        ))
+        
+        # Đánh dấu Đáy Lịch Sử
+        min_idx = df['DrawdownPct'].idxmin()
+        if pd.notnull(min_idx):
+            min_date = df.loc[min_idx, date_col]
+            
+            fig.add_annotation(
+                x=min_date, y=max_dd,
+                text=f"Đáy Sâu Nhất: {max_dd:.1f}%",
+                showarrow=True, arrowhead=1, ax=0, ay=40,
+                arrowcolor="#EF553B",
+                font=dict(color="#EF553B", weight="bold")
+            )
+
+        fig.update_layout(
+            title="Biểu Đồ Sụt Giảm Vốn (Underwater)",
+            xaxis_title="Thời Gian",
+            yaxis_title="Sụt Giảm Từ Đỉnh (%)",
+            height=350,
+            showlegend=False,
+            margin=dict(t=40, b=20, l=0, r=0),
+            hovermode="x unified" # Hiển thị đường gióng dọc để dễ so sánh
+        )
+        
+        # Trả về: Figure, MaxDD (dương), CurrentDD (dương) để hiển thị KPI
+        return fig, abs(max_dd), abs(current_dd)
 
     except Exception as e:
-        st.error(f"Lỗi vẽ Heatmap: {e}")
-        return None
+        return None, 0, 0

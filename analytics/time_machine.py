@@ -1,4 +1,5 @@
 # File: analytics/time_machine.py
+# Version: EXPERT FIX (Trade Date Basis - Remove Double Counting)
 import pandas as pd
 from datetime import timedelta
 
@@ -13,16 +14,20 @@ class TimeMachine:
         
         # Trạng thái tài khoản (State)
         self.current_cash = 0.0
-        self.current_deposit = 0.0 # Vốn gốc đã nạp ròng
+        self.current_deposit = 0.0 # Vốn nạp ròng (Net Deposit)
         self.inventory = {} # {symbol: {'vol': 0, 'cost': 0}}
-        self.portfolio_value = 0.0 # Giá trị kho (theo giá vốn)
+        self.portfolio_value = 0.0 
 
     def run(self):
         if not self.events: return pd.DataFrame()
 
-        # Tạo khung thời gian từ ngày đầu tiên đến hôm nay
+        # [UPDATE] Mở rộng khung thời gian để bao gồm dữ liệu tương lai (2025)
         start_date = self.events[0]['date']
-        end_date = pd.Timestamp.now()
+        
+        # Tìm ngày xa nhất: So sánh 'Hôm nay' và 'Ngày cuối trong file Excel'
+        last_event_date = self.events[-1]['date']
+        end_date = max(pd.Timestamp.now(), last_event_date)
+        
         date_range = pd.date_range(start=start_date, end=end_date, freq='D')
         
         # Gom nhóm sự kiện theo ngày để xử lý
@@ -45,88 +50,136 @@ class TimeMachine:
             self._update_portfolio_value()
             
             # Ghi lại trạng thái cuối ngày (Snapshot)
+            # NAV = Tiền (Sức mua) + Giá trị cổ phiếu
+            nav = self.current_cash + self.portfolio_value
+            
             self.history.append({
                 'Ngày': day,
                 'Tiền Mặt': self.current_cash,
-                'Giá Trị Kho': self.portfolio_value,
-                'Tổng Tài Sản (NAV)': self.current_cash + self.portfolio_value,
-                'Vốn Nạp Ròng': self.current_deposit
+                'Giá Trị Cổ Phiếu': self.portfolio_value, 
+                'Tổng Tài Sản (NAV)': nav, 
+                'Vốn Nạp Ròng': self.current_deposit,
+                'Lãi/Lỗ Tạm Tính': nav - self.current_deposit
             })
 
         return pd.DataFrame(self.history)
 
     def _process_single_event(self, e):
         evt_type = e['type']
-        val = e.get('val', 0)
-        sym = e.get('sym')
+        val = e.get('value', 0) if e.get('value', 0) > 0 else e.get('val', 0)
+        
+        # Chuẩn hóa mã CK
+        raw_sym = e.get('ticker') or e.get('sym')
+        sym = None
+        if raw_sym and str(raw_sym).lower() != 'nan':
+            sym = str(raw_sym).strip().upper()
 
-        # 1. ƯU TIÊN SỐ 1: SNAPSHOT TIỀN (Chính xác tuyệt đối)
+        # =================================================================
+        # 1. NHÓM SỰ KIỆN ƯU TIÊN (SNAPSHOT)
+        # =================================================================
         if evt_type == 'CASH_SNAPSHOT':
-            self.current_cash = val
+            if val > 0: self.current_cash = val
             return
 
-        # 2. DÒNG TIỀN VÀO/RA
-        if evt_type == 'DEPOSIT':
-            # current_cash += val # Snapshot sẽ ghi đè, nhưng cộng để track nếu thiếu snapshot
-            # Logic: Nếu có snapshot rồi thì deposit chỉ để tính Vốn Nạp Ròng
+        # =================================================================
+        # 2. NHÓM VỐN (NẠP / RÚT) - ẢNH HƯỞNG VỐN GỐC
+        # =================================================================
+        if evt_type in ['DEPOSIT', 'NAP_TIEN']:
             self.current_deposit += val
-            # Tạm thời vẫn cộng vào cash để support những ngày chưa có snapshot
             self.current_cash += val
+            return
         
-        elif evt_type == 'PNL_UPDATE': # Lãi đã chốt -> Cộng vào tiền (nếu chưa có snapshot)
-            self.current_cash += val
+        if evt_type in ['WITHDRAW', 'RUT_TIEN']:
+            self.current_deposit -= val
+            self.current_cash -= val
+            return
+
+        # =================================================================
+        # 3. NHÓM GIAO DỊCH (MUA / BÁN) - ẢNH HƯỞNG NAV & TIỀN
+        # =================================================================
+        # MUA: Trừ tiền, Tăng kho
+        if evt_type in ['BUY', 'MUA']:
+            # Tính giá trị mua
+            vol = e.get('qty', 0) if e.get('qty', 0) > 0 else e.get('vol', 0)
+            price = e.get('price', 0)
             
-        elif evt_type == 'DIVIDEND': # Cổ tức -> Cộng tiền
+            # Nếu có 'value' (từ sheet Tiền) thì dùng luôn, ko thì tính vol*price
+            total_cost = val if val > 0 else (price * vol)
+            
+            self.current_cash -= total_cost
+            
+            # Nhập kho
+            if vol > 0 and sym:
+                if sym not in self.inventory: self.inventory[sym] = {'vol': 0, 'cost': 0}
+                stock = self.inventory[sym]
+                
+                # Tính giá vốn bình quân (Weighted Avg)
+                new_vol = stock['vol'] + vol
+                if new_vol > 0:
+                    current_val = stock['vol'] * stock['cost']
+                    stock['cost'] = (current_val + total_cost) / new_vol
+                stock['vol'] = new_vol
+            return
+
+        # BÁN: Cộng tiền (Doanh thu), Giảm kho
+        if evt_type in ['SELL', 'BAN']:
+            vol = e.get('qty', 0) if e.get('qty', 0) > 0 else e.get('vol', 0)
+            price = e.get('price', 0)
+            fee = e.get('fee', 0)
+            
+            # Doanh thu thực nhận (tính luôn vào tiền mặt tại ngày giao dịch)
+            revenue = (price * vol) - fee
+            
+            # Nếu dùng external pnl (như VPS), tiền có thể đã được update qua snapshot
+            # Nhưng với VCK, ta cộng doanh thu vào tiền ngay lập tức (Trade Date)
+            if not e.get('use_external_pnl', False):
+                self.current_cash += revenue
+            
+            # Xuất kho
+            if sym and sym in self.inventory:
+                stock = self.inventory[sym]
+                stock['vol'] = max(0, stock['vol'] - vol)
+            return
+
+        # =================================================================
+        # 4. NHÓM PHÍ & CỔ TỨC (ẢNH HƯỞNG LỢI NHUẬN)
+        # =================================================================
+        if evt_type in ['FEE', 'PHI_THUE']:
+            self.current_cash -= val
+            return
+            
+        if evt_type in ['DIVIDEND', 'CO_TUC_TIEN']:
             self.current_cash += val
-            # Trừ giá vốn điều chỉnh
+            # Điều chỉnh giá vốn (nếu muốn NAV chuẩn hơn thì trừ giá vốn)
             if sym and sym in self.inventory:
                 stock = self.inventory[sym]
                 if stock['vol'] > 0:
                     reduction = val / stock['vol']
                     stock['cost'] -= reduction
+            return
 
-        elif evt_type == 'FEE':
-            self.current_cash -= val
+        # =================================================================
+        # 5. NHÓM THANH TOÁN BÙ TRỪ (IGNORE ĐỂ TRÁNH TRÙNG LẶP)
+        # =================================================================
+        # Tại sao bỏ qua? 
+        # Vì tiền bán (BAN_TIEN_VE) đã được cộng ở lệnh SELL phía trên.
+        # Vì tiền ứng (UNG_TRUOC) cũng là một dạng tiền bán về sớm.
+        # Vì hoàn ứng (HOAN_UNG) là trả nợ, không làm thay đổi NAV ròng.
+        if evt_type in ['BAN_TIEN_VE', 'UNG_TRUOC', 'HOAN_UNG']:
+            return 
 
-        # 3. MUA BÁN KHO (Inventory)
-        elif evt_type == 'BUY':
-            cost = e.get('price', 0)
-            vol = e.get('vol', 0)
-            # Trừ tiền (nếu ko phải hàng 0 đồng)
-            total_cost = cost * vol + e.get('fee', 0)
-            self.current_cash -= total_cost
-            
-            # Nhập kho
-            if sym not in self.inventory: self.inventory[sym] = {'vol': 0, 'cost': 0}
-            stock = self.inventory[sym]
-            
-            # Tính lại giá vốn bình quân (Weighted Avg Price)
-            new_vol = stock['vol'] + vol
-            if new_vol > 0:
-                stock['cost'] = ((stock['cost'] * stock['vol']) + total_cost) / new_vol
-            stock['vol'] = new_vol
-
-        elif evt_type == 'SELL':
-            price = e.get('price', 0) # Giá bán
-            vol = e.get('vol', 0)
-            fee = e.get('fee', 0)
-            revenue = (price * vol) - fee
-            
-            # Nếu có cờ use_external_pnl (VPS), doanh thu đã được tính qua PNL_UPDATE hoặc Snapshot rồi
-            # Nên ở đây ta KHÔNG cộng tiền nữa để tránh tính kép, chỉ trừ kho thôi.
-            if not e.get('use_external_pnl', False):
-                self.current_cash += revenue
-            
-            # Xuất kho
-            if sym in self.inventory:
-                stock = self.inventory[sym]
-                stock['vol'] = max(0, stock['vol'] - vol)
-                # Giá vốn đơn vị giữ nguyên khi bán, chỉ giảm số lượng
+        # Lãi/Lỗ đã chốt từ file (dành cho VPS)
+        if evt_type == 'PNL_UPDATE':
+            self.current_cash += val
+            return
 
     def _update_portfolio_value(self):
         """Tính tổng giá trị các mã đang giữ theo giá vốn điều chỉnh"""
         total = 0
-        for sym, stock in self.inventory.items():
+        for raw_sym, stock in self.inventory.items():
+            if pd.isna(raw_sym): continue
+            sym = str(raw_sym).strip().upper()
+            
             # Không tính giá trị cho mã WFT để biểu đồ NAV sát thực tế hơn
             if not sym.endswith('_WFT'):
                 total += stock['vol'] * stock['cost']
