@@ -8,20 +8,33 @@ import configs # File cấu hình
 # --- IMPORT MODULES ---
 try:
     from processors.adapter_vck import VCKAdapter
+    from processors.vck_patch import VCKPatch
     from processors.adapter_vps import VPSAdapter
     from processors.engine import PortfolioEngine
     from processors.live_price import get_current_price_dict
     from utils.formatters import fmt_vnd, fmt_num, fmt_pct, fmt_float
     from analytics.performance import calculate_kpi
     from processors.ipo_merger import merge_ipo_events
-    
+    from modules.wealth_management.wealth_view import render_wealth_tab # <--- Mới
+
     # Import Module Vá Lỗi Cổ Tức
     import patch_dividend_fix 
     
     # Import Views
     from views import dashboard_asset
     from views import dashboard_account_single
+    # Import Views module mới
+    from modules.vip_deals.view import render_vip_deals_tab
+
+    # [THÊM DÒNG NÀY] Import module tự động cập nhật
+    from modules.market_updater import check_and_update_market_data
+
+    # [THÊM DÒNG NÀY] Gọi hàm cập nhật ngay khi App khởi động
+    check_and_update_market_data()
     
+    # [NEW] Import Module La Bàn & Loader (QUAN TRỌNG)
+    from modules.benchmarking.benchmark_view import render_benchmark_tab
+    from modules.benchmarking.loader import create_compass_engine
     # Components
     from components.psychology_charts import (
         draw_trading_timeline, 
@@ -78,23 +91,35 @@ if btn_run:
         engine_vck = PortfolioEngine("VCK")
         engine_vps = PortfolioEngine("VPS")
         
+        # Biến lưu trữ dữ liệu thô để lát nữa đưa sang La Bàn
+        raw_events_vck_for_compass = [] 
+        raw_events_vps_for_compass = []
+        
         list_vck = []
         list_vps = []
         all_events = []
 
+        # ==================================================================
+        # LUỒNG A: HỆ THỐNG CŨ (LEGACY) - GIỮ NGUYÊN KHÔNG PATCH
+        # ==================================================================
+        
         # Xử lý VCK
         if file_vck:
             try:
-                # 1. Parse dữ liệu (Adapter trả về thô)
+                # 1. Parse dữ liệu (Adapter cũ)
                 raw_events = VCKAdapter().parse(file_vck)
+                raw_events_vck_for_compass = raw_events # Lưu lại bản gốc cho La Bàn dùng sau
                 
-                # 2. [MỚI] Chạy qua bộ xử lý IPO
-                events = merge_ipo_events(raw_events)
+                # --- [REVERT] BỎ ĐOẠN PATCH Ở ĐÂY ĐỂ TRÁNH ẢNH HƯỞNG BÁO CÁO CŨ ---
+                # (Không gọi VCKPatch ở đây nữa)
                 
-                # 3. Chạy Engine (như cũ)
-                for e in events: engine_vck.process_event(e)
+                # 2. Chạy qua bộ xử lý IPO (Dùng raw_events gốc)
+                events = merge_ipo_events(raw_events) 
                 
-                # 4. Patch cổ tức
+                # 3. Chạy Engine Chính (Dùng hàm run để kích hoạt Snapshot Authority)
+                engine_vck.run(events)
+                
+                # 4. Patch cổ tức (Giữ nguyên)
                 patch_dividend_fix.apply_dividend_patch(engine_vck, file_vck)
                 
                 list_vck = events 
@@ -104,24 +129,38 @@ if btn_run:
         # Xử lý VPS
         if file_vps:
             try:
-                # 1. Parse dữ liệu (Adapter mới tự lo mọi thứ, trả về list events chuẩn)
                 events = VPSAdapter().parse(file_vps)
+                raw_events_vps_for_compass = events # Lưu lại cho La Bàn
                 
-                # 2. Chạy Engine
-                for e in events: engine_vps.process_event(e)
-                
-                # 3. Patch cổ tức
+                engine_vps.run(events)
                 patch_dividend_fix.apply_dividend_patch(engine_vps, file_vps)
                 
                 list_vps = events 
                 all_events.extend(events) 
             except Exception as e: st.error(f"Lỗi đọc file VPS: {e}")
 
+        # Lưu Session State cho Báo cáo cũ
         st.session_state.engine_vck = engine_vck
         st.session_state.engine_vps = engine_vps
         st.session_state.events_vck = list_vck
         st.session_state.events_vps = list_vps
         st.session_state.timeline_events = all_events
+
+        # ==================================================================
+        # LUỒNG B: HỆ THỐNG MỚI (LA BÀN - COMPASS) - ĐỘC LẬP
+        # ==================================================================
+        # ==================================================================
+        # [CẬP NHẬT] CHUẨN BỊ DỮ LIỆU CHO LA BÀN (COMPASS)
+        # Thay vì tạo Engine ngay, ta lưu "Nguyên liệu" vào Session State
+        # để Tab La Bàn tự tạo Engine theo lựa chọn (VCK/VPS/Tổng)
+        # ==================================================================
+        
+        # Lưu dữ liệu thô VCK
+        st.session_state.compass_raw_vck = raw_events_vck_for_compass
+        st.session_state.compass_file_vck = file_vck
+        
+        # Lưu dữ liệu thô VPS
+        st.session_state.compass_raw_vps = raw_events_vps_for_compass
         st.session_state.data_processed = True
         st.rerun()
 
@@ -260,15 +299,20 @@ if st.session_state.data_processed:
     elif not df_vps_ready.empty:
         df_history_global = df_history_vps
 
-    # --- TAB LAYOUT ---
-    tab_asset, tab_vck, tab_vps, tab_anal = st.tabs([
-        "🏠 TỔNG QUAN TÀI SẢN", "📘 TÀI KHOẢN VCK", "📕 TÀI KHOẢN VPS", "⚡ PHÂN TÍCH NÂNG CAO"
+    # --- TAB LAYOUT (ĐÃ CẬP NHẬT THÊM QUẢN LÝ TÀI SẢN) ---
+    tab_asset, tab_vck, tab_vps, tab_anal, tab_vip, tab_benchmark, tab_wealth = st.tabs([
+        "🏠 TỔNG QUAN TÀI SẢN", 
+        "📘 TÀI KHOẢN VCK", 
+        "📕 TÀI KHOẢN VPS", 
+        "⚡ PHÂN TÍCH NÂNG CAO",
+        "💎 KHO BÁU IPO & DEAL",
+        "🧭 LA BÀN THỊ TRƯỜNG",
+        "🏛️ QUẢN LÝ TÀI SẢN"
     ])
 
     # Tab 1: Tổng Quan
     with tab_asset:
         df_sum_all = pd.concat([df_s_vck, df_s_vps]) if not df_s_vck.empty or not df_s_vps.empty else pd.DataFrame()
-        # Truyền total_all_in_profit (đã fix) vào hàm hiển thị
         dashboard_asset.display(total_dep, total_cash, total_mkt, unrealized_pnl, real_nav, total_all_in_profit, df_history_global, df_sum_all, KPI_TIPS)
         st.success(f"🔎 **Chi tiết Vốn Nạp:** VCK = **{fmt_vnd(engine_vck.total_deposit)}** | VPS = **{fmt_vnd(engine_vps.total_deposit)}**")
 
@@ -359,6 +403,46 @@ if st.session_state.data_processed:
                     k2.metric("Current Drawdown (Hiện tại)", f"{curr_dd:.2f}%", help="Bạn đang cách đỉnh tài sản bao nhiêu %.")
                     st.plotly_chart(fig_dd, use_container_width=True)
             else: st.info(f"Chưa đủ dữ liệu lịch sử NAV của {acc_opt} để vẽ Drawdown (Cần tối thiểu 2 ngày).")
+    
+    # Tab 5: VIP Deals
+    with tab_vip:
+        st.markdown("### 🎯 Phân Tích Chuyên Sâu Các Deal Đặc Biệt")
+        options = []
+        if engine_vck and engine_vck.total_deposit > 0: options.append("VCK")
+        if engine_vps and engine_vps.total_deposit > 0: options.append("VPS")
+        
+        if not options:
+            st.warning("Vui lòng Upload file dữ liệu để xem phân tích.")
+        else:
+            selected_acc = st.radio("Chọn nguồn dữ liệu phân tích:", options, horizontal=True)
+            target_engine = engine_vck if selected_acc == "VCK" else engine_vps
+            render_vip_deals_tab(target_engine, live_prices, account_name=selected_acc)
 
-else:
-    st.info("👋 Chào mừng! Vui lòng upload file dữ liệu VCK hoặc VPS.")
+    # ---------------------------------------------------------
+    # TAB 6: LA BÀN THỊ TRƯỜNG (BENCHMARKING)
+    # ---------------------------------------------------------
+    with tab_benchmark:
+        has_vck = 'compass_raw_vck' in st.session_state and st.session_state.compass_raw_vck is not None
+        has_vps = 'compass_raw_vps' in st.session_state and st.session_state.compass_raw_vps is not None
+        
+        if has_vck or has_vps:
+            raw_vck = st.session_state.get('compass_raw_vck')
+            file_vck_obj = st.session_state.get('compass_file_vck')
+            raw_vps = st.session_state.get('compass_raw_vps')
+            
+            vck_package = (raw_vck, file_vck_obj) if raw_vck else None
+            render_benchmark_tab(vck_package, raw_vps, live_prices)
+        else:
+            st.info("👋 Chức năng La Bàn cần dữ liệu. Vui lòng bấm 'CHẠY PHÂN TÍCH'.")
+
+    # ---------------------------------------------------------
+    # TAB 7: QUẢN LÝ TÀI SẢN (WEALTH MANAGEMENT) - [UPDATED]
+    # ---------------------------------------------------------
+    with tab_wealth:
+        # Kiểm tra xem đã chạy phân tích chưa
+        if st.session_state.data_processed:
+            # Gọi hàm hiển thị, truyền toàn bộ session_state vào để bên trong tự lọc
+            render_wealth_tab(st.session_state, live_prices)
+        else:
+             st.info("📊 Vui lòng bấm 'CHẠY PHÂN TÍCH' để kích hoạt tính năng này.")
+      
